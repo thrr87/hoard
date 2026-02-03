@@ -1,0 +1,26 @@
+.DS_Store
+.pytest_cache/
+__pycache__/
+*.pyc
+.venv/
+.env
+.env.*
+
+# Build / packaging
+/build/
+/dist/
+*.egg-info/
+
+# Local tooling
+.claude/
+
+# Local data
+/docs/
+
+# Logs / runtime
+.hoard/
+*.log
+
+# Editor
+.vscode/
+.idea/
