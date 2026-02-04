@@ -76,6 +76,6 @@ def run_sync(conn, *, config: dict, source: str | None = None) -> dict:
             "chunks_written": stats.chunks_written,
             "entities_tombstoned": stats.entities_tombstoned,
             "errors": stats.errors,
-            "started_at": stats.started_at.isoformat(timespec=\"seconds\"),
+            "started_at": stats.started_at.isoformat(timespec="seconds"),
         }
     return results
