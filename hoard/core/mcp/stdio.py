@@ -133,7 +133,7 @@ class StdioMCPServer:
         limiter = RateLimiter(conn, self.config, enforce=False)
 
         try:
-            token = authenticate_token(token_value, self.config, conn)
+            token = authenticate_token(token_value, self.config)
             if is_write_tool(tool_name):
                 return self._build_error(
                     msg_id,

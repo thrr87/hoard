@@ -67,6 +67,8 @@ class Worker:
                 self._writer.submit(self._complete_job, job_id)
 
     def _acquire_or_renew_lease(self, conn, lease_seconds: int) -> bool:
+        if not self._worker_id:
+            self._worker_id = f"worker-{socket.gethostname()}-{os.getpid()}-{id(self)}"
         now = datetime.utcnow().isoformat(timespec="seconds")
         expires_at = (datetime.utcnow() + timedelta(seconds=lease_seconds)).isoformat(timespec="seconds")
         cursor = conn.execute(
