@@ -5,9 +5,12 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from typing import Any, Dict
 
+import click
+
 from hoard import __version__
 from hoard.core.config import load_config, resolve_paths
-from hoard.core.db.connection import connect, initialize_db
+from hoard.core.db.connection import connect
+from hoard.migrations import get_current_version, get_migrations, migrate
 from hoard.core.mcp.tools import count_chunks, dispatch_tool, tool_definitions
 from hoard.core.security.audit import log_access
 from hoard.core.security.auth import AuthError, ScopeError, authenticate_token
@@ -42,7 +45,6 @@ class MCPRequestHandler(BaseHTTPRequestHandler):
         token = None
         tool = self._tool_name()
         conn = connect(self.server.db_path)
-        initialize_db(conn)
         limiter = RateLimiter(conn, self.server.config, enforce=True)
 
         try:
@@ -79,7 +81,6 @@ class MCPRequestHandler(BaseHTTPRequestHandler):
         payload = json.loads(body) if body else {}
 
         conn = connect(self.server.db_path)
-        initialize_db(conn)
         limiter = RateLimiter(conn, self.server.config, enforce=True)
 
         try:
@@ -172,8 +173,28 @@ class MCPServer(HTTPServer):
         super().__init__(server_address, RequestHandlerClass)
 
 
-def run_server(host: str = "127.0.0.1", port: int = 19850, config_path: Path | None = None) -> None:
+def run_server(
+    host: str = "127.0.0.1",
+    port: int = 19850,
+    config_path: Path | None = None,
+    no_migrate: bool = False,
+) -> None:
     server = MCPServer((host, port), MCPRequestHandler, config_path)
+
+    conn = connect(server.db_path)
+    try:
+        if no_migrate:
+            migrations = get_migrations()
+            latest = max(migrations.keys()) if migrations else 0
+            current = get_current_version(conn)
+            if current < latest:
+                click.echo(f"⚠️  Schema migrations pending (v{current} → v{latest})")
+                click.echo("   Run 'hoard db migrate' or restart without --no-migrate")
+        else:
+            migrate(conn, app_version=__version__)
+    finally:
+        conn.close()
+
     server.serve_forever()
 
 
