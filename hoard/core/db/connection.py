@@ -35,5 +35,5 @@ def executemany(conn: sqlite3.Connection, sql: str, rows: Iterable[tuple]) -> No
 def ensure_sqlite_version(min_version: tuple[int, int, int] = (3, 35, 0)) -> None:
     if sqlite3.sqlite_version_info < min_version:
         raise RuntimeError(
-            f\"SQLite {min_version} required, found {sqlite3.sqlite_version}\"
+            f"SQLite {min_version} required, found {sqlite3.sqlite_version}"
         )
