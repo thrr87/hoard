@@ -1,4 +1,18 @@
-# Hoard
+```
+    ╔═══════════════════════════════════════════════════════╗
+    ║  ██╗  ██╗ ██████╗  █████╗ ██████╗ ██████╗             ║
+    ║  ██║  ██║██╔═══██╗██╔══██╗██╔══██╗██╔══██╗            ║
+    ║  ███████║██║   ██║███████║██████╔╝██║  ██║            ║
+    ║  ██╔══██║██║   ██║██╔══██║██╔══██╗██║  ██║            ║
+    ║  ██║  ██║╚██████╔╝██║  ██║██║  ██║██████╔╝            ║
+    ║  ╚═╝  ╚═╝ ╚═════╝ ╚═╝  ╚═╝╚═╝  ╚═╝╚═════╝             ║
+    ║                                                       ║
+    ║         Your Personal Data Layer                      ║
+    ║                                                       ║
+    ║  One local index • Hybrid search • MCP interface      ║
+    ║  Chunk-level citations • Works with any AI agent      ║
+    ╚═══════════════════════════════════════════════════════╝
+```
 
 **Hoard** is a local MCP data layer that indexes your personal knowledge into SQLite and exposes it through fast search, memory tools, and MCP-compatible servers.
 
