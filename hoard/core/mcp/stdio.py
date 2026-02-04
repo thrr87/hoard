@@ -7,9 +7,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Optional
 
+import click
+
 from hoard import __version__
 from hoard.core.config import load_config, resolve_paths
-from hoard.core.db.connection import connect, initialize_db
+from hoard.core.db.connection import connect
+from hoard.migrations import migrate
 from hoard.core.mcp.tools import count_chunks, dispatch_tool, tool_definitions
 from hoard.core.security.audit import log_access
 from hoard.core.security.auth import AuthError, ScopeError, authenticate_token
@@ -127,7 +130,6 @@ class StdioMCPServer:
             return self._build_error(msg_id, -32000, "Missing auth token")
 
         conn = connect(self.db_path)
-        initialize_db(conn)
         limiter = RateLimiter(conn, self.config, enforce=True)
 
         try:
@@ -180,6 +182,16 @@ class StdioMCPServer:
 
 def run_stdio(config_path: Path | None = None) -> None:
     server = StdioMCPServer(config_path)
+
+    conn = connect(server.db_path)
+    try:
+        migrate(conn, app_version=__version__)
+    except Exception as exc:
+        click.echo(f"Failed to apply migrations: {exc}", err=True)
+        raise
+    finally:
+        conn.close()
+
     server.serve_forever()
 
 

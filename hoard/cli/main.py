@@ -244,6 +244,161 @@ def search_command(
     conn.close()
 
 
+@cli.group("db")
+def db_group() -> None:
+    """Database utilities."""
+
+
+@db_group.command("status")
+@click.option("--config", "config_path", type=click.Path(path_type=Path))
+def db_status_command(config_path: Path | None) -> None:
+    from hoard.migrations import MigrationError, get_current_version, get_migrations, get_pending_versions
+
+    config = load_config(config_path)
+    paths = resolve_paths(config, config_path)
+    conn = connect(paths.db_path)
+
+    migrations = get_migrations()
+    latest = max(migrations.keys()) if migrations else 0
+    current = get_current_version(conn)
+
+    console.print(f"Database: {paths.db_path}")
+    console.print(f"Schema version: {current}")
+    console.print(f"Latest available: {latest}")
+
+    if current > latest:
+        console.print(
+            "[yellow]⚠️  Database version is newer than code. "
+            "Did you downgrade Hoard?[/yellow]"
+        )
+
+    try:
+        pending = get_pending_versions(conn, target_version=latest) if current <= latest else []
+    except MigrationError as exc:
+        conn.close()
+        raise click.ClickException(str(exc)) from exc
+    console.print(f"Pending migrations: {len(pending)}")
+    for version in pending:
+        name = migrations[version].__name__.split(".")[-1]
+        console.print(f"  - {name}")
+
+    conn.close()
+
+
+@db_group.command("migrate")
+@click.option("--to", "target_version", type=int, default=None, help="Target version")
+@click.option("--config", "config_path", type=click.Path(path_type=Path))
+def db_migrate_command(target_version: int | None, config_path: Path | None) -> None:
+    from hoard import __version__
+    from hoard.migrations import MigrationError, get_current_version, get_migrations, migrate
+
+    config = load_config(config_path)
+    paths = resolve_paths(config, config_path)
+    conn = connect(paths.db_path)
+
+    current = get_current_version(conn)
+    migrations = get_migrations()
+    latest = max(migrations.keys()) if migrations else 0
+    target = target_version if target_version is not None else latest
+    console.print(f"📦 Applying schema migrations (v{current} → v{target})...")
+
+    try:
+        applied = migrate(conn, target_version=target_version, app_version=__version__)
+    except MigrationError as exc:
+        conn.close()
+        raise click.ClickException(str(exc)) from exc
+
+    if not applied:
+        console.print("No pending migrations.")
+        conn.close()
+        return
+
+    placeholders = ",".join("?" for _ in applied)
+    rows = conn.execute(
+        f"""
+        SELECT version, name, duration_ms
+        FROM schema_migrations
+        WHERE version IN ({placeholders})
+        ORDER BY version
+        """,
+        applied,
+    ).fetchall()
+    for row in rows:
+        version, name, duration_ms = row[0], row[1], row[2]
+        console.print(f"  {name} ... done ({duration_ms}ms)")
+
+    console.print(f"Migrated from version {current} to {applied[-1]}")
+    conn.close()
+
+
+@db_group.command("history")
+@click.option("--config", "config_path", type=click.Path(path_type=Path))
+def db_history_command(config_path: Path | None) -> None:
+    import sqlite3
+
+    config = load_config(config_path)
+    paths = resolve_paths(config, config_path)
+    conn = connect(paths.db_path)
+
+    try:
+        rows = conn.execute(
+            "SELECT version, name, applied_at, duration_ms FROM schema_migrations ORDER BY version"
+        ).fetchall()
+    except sqlite3.OperationalError:
+        rows = []
+
+    table = Table(title="Migration History", show_header=True)
+    table.add_column("Version", justify="right")
+    table.add_column("Name")
+    table.add_column("Applied")
+    table.add_column("Duration", justify="right")
+
+    for row in rows:
+        version, name, applied_at, duration_ms = row[0], row[1], row[2], row[3]
+        table.add_row(str(version), name, applied_at, f"{duration_ms}ms" if duration_ms else "-")
+
+    if not rows:
+        console.print("No migration history found.")
+    else:
+        console.print(table)
+
+    conn.close()
+
+
+@db_group.command("verify")
+@click.option("--deep", is_flag=True, default=False, help="Run integrity_check (slower)")
+@click.option("--config", "config_path", type=click.Path(path_type=Path))
+def db_verify_command(deep: bool, config_path: Path | None) -> None:
+    from hoard.migrations import check_migration_integrity, get_migrations
+
+    config = load_config(config_path)
+    paths = resolve_paths(config, config_path)
+    conn = connect(paths.db_path)
+
+    fk_errors = conn.execute("PRAGMA foreign_key_check").fetchall()
+    if fk_errors:
+        console.print(f"[red]✗[/red] Foreign key check: {len(fk_errors)} violations")
+    else:
+        console.print("[green]✓[/green] Foreign key check: passed")
+
+    mismatches = check_migration_integrity(conn, get_migrations(), warn=False)
+    if mismatches:
+        console.print(f"[red]✗[/red] Migration checksums: {len(mismatches)} mismatches")
+        for version, name, stored, current in mismatches:
+            console.print(f"  {version} {name}: stored={stored} current={current}")
+    else:
+        console.print("[green]✓[/green] Migration checksums: all match")
+
+    if deep:
+        result = conn.execute("PRAGMA integrity_check").fetchone()[0]
+        if result == "ok":
+            console.print("[green]✓[/green] SQLite integrity_check: ok")
+        else:
+            console.print(f"[red]✗[/red] SQLite integrity_check: {result}")
+
+    conn.close()
+
+
 @cli.group("memory")
 def memory_group() -> None:
     """Manage memory entries."""
@@ -521,6 +676,7 @@ def sync_status_command(config_path: Path | None) -> None:
 @click.option("--daemon", is_flag=True, default=False, help="Run as background daemon")
 @click.option("--status", is_flag=True, default=False, help="Check daemon status")
 @click.option("--stop", is_flag=True, default=False, help="Stop daemon")
+@click.option("--no-migrate", is_flag=True, default=False, help="Skip automatic schema migrations")
 @click.option(
     "--install-autostart",
     is_flag=True,
@@ -533,6 +689,7 @@ def serve_command(
     daemon: bool,
     status: bool,
     stop: bool,
+    no_migrate: bool,
     install_autostart: bool,
 ) -> None:
     config = load_config(None)
@@ -551,11 +708,11 @@ def serve_command(
         return
 
     if daemon:
-        _serve_daemon(host, port)
+        _serve_daemon(host, port, no_migrate=no_migrate)
         return
 
     console.print(f"Starting Hoard server on http://{host}:{port}/mcp")
-    run_server(host=host, port=port, config_path=None)
+    run_server(host=host, port=port, config_path=None, no_migrate=no_migrate)
 
 
 @cli.group("mcp")
@@ -566,10 +723,11 @@ def mcp_group() -> None:
 @mcp_group.command("serve")
 @click.option("--host", default="127.0.0.1", show_default=True)
 @click.option("--port", default=19850, show_default=True)
+@click.option("--no-migrate", is_flag=True, default=False, help="Skip automatic schema migrations")
 @click.option("--config", "config_path", type=click.Path(path_type=Path))
-def mcp_serve_command(host: str, port: int, config_path: Path | None) -> None:
+def mcp_serve_command(host: str, port: int, no_migrate: bool, config_path: Path | None) -> None:
     console.print(f"Starting MCP server on {host}:{port}")
-    run_server(host=host, port=port, config_path=config_path)
+    run_server(host=host, port=port, config_path=config_path, no_migrate=no_migrate)
 
 
 @mcp_group.command("stdio")
@@ -1165,15 +1323,18 @@ def _daemon_paths() -> tuple[Path, Path]:
     return base / "hoard.pid", base / "hoard.log"
 
 
-def _serve_daemon(host: str, port: int) -> None:
+def _serve_daemon(host: str, port: int, no_migrate: bool = False) -> None:
     pid_path, log_path = _daemon_paths()
     if pid_path.exists():
         console.print("Hoard server already running.")
         return
 
     log_file = log_path.open("ab")
+    command = [sys.executable, "-m", "hoard.cli.main", "serve", "--host", host, "--port", str(port)]
+    if no_migrate:
+        command.append("--no-migrate")
     process = subprocess.Popen(
-        [sys.executable, "-m", "hoard.cli.main", "serve", "--host", host, "--port", str(port)],
+        command,
         stdout=log_file,
         stderr=log_file,
         start_new_session=True,
