@@ -9,6 +9,7 @@ from hoard.core.ingest.store import (
     upsert_entity,
 )
 from hoard.core.models import SyncStats
+from hoard.core.ingest.registry import iter_enabled_connectors
 from hoard.sdk.base import ConnectorV1
 from hoard.sdk.types import EntityInput
 
@@ -62,3 +63,19 @@ def _apply_provenance(connector: ConnectorV1, entity: EntityInput) -> None:
         entity.connector_version = connector.version
     if not entity.source:
         entity.source = connector.source_name
+
+
+def run_sync(conn, *, config: dict, source: str | None = None) -> dict:
+    results: dict[str, dict] = {}
+    for name, connector, settings in iter_enabled_connectors(config):
+        if source and name != source:
+            continue
+        stats = sync_connector(conn, connector, settings)
+        results[name] = {
+            "entities_seen": stats.entities_seen,
+            "chunks_written": stats.chunks_written,
+            "entities_tombstoned": stats.entities_tombstoned,
+            "errors": stats.errors,
+            "started_at": stats.started_at.isoformat(timespec=\"seconds\"),
+        }
+    return results

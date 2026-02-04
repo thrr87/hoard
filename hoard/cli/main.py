@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import secrets
 import json
 import os
 import shutil
@@ -8,23 +7,20 @@ import signal
 import subprocess
 import sys
 import time
+import urllib.error
+import urllib.request
 from pathlib import Path
 from typing import List
 
 import click
 from rich.console import Console
-from rich.progress import BarColumn, Progress, TaskProgressColumn, TextColumn, TimeRemainingColumn
 from rich.table import Table
 
 from hoard.core.config import ensure_config_file, load_config, resolve_paths, save_config
 from hoard.core.db.connection import connect, initialize_db
 from hoard.core.embeddings.model import EmbeddingError, EmbeddingModel
-from hoard.core.embeddings.store import build_embeddings
-from hoard.core.ingest.registry import iter_enabled_connectors
-from hoard.core.ingest.sync import sync_connector
 from hoard.core.mcp.server import run_server
 from hoard.core.mcp.stdio import run_stdio
-from hoard.core.memory.store import memory_get, memory_put, memory_search
 from hoard.core.search.service import search_entities
 from hoard.core.onboarding import (
     detect_chrome_bookmarks_paths,
@@ -34,6 +30,45 @@ from hoard.core.onboarding import (
 )
 
 console = Console()
+
+
+def _mcp_url(config: dict) -> str:
+    host = config.get("server", {}).get("host", "127.0.0.1")
+    port = int(config.get("server", {}).get("port", 19850))
+    return f"http://{host}:{port}/mcp"
+
+
+def _call_mcp(config: dict, method: str, params: dict, *, token_override: str | None = None) -> dict:
+    token = token_override or os.environ.get("HOARD_TOKEN")
+    if not token:
+        raise click.ClickException("HOARD_TOKEN is required for this command.")
+    req = urllib.request.Request(
+        _mcp_url(config),
+        data=json.dumps({"jsonrpc": "2.0", "id": 1, "method": method, "params": params}).encode(),
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {token}",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            payload = json.loads(resp.read())
+    except urllib.error.HTTPError as exc:
+        raise click.ClickException(f"Server error: {exc}") from exc
+    except urllib.error.URLError as exc:
+        raise click.ClickException(f"Server unreachable: {exc}") from exc
+
+    if isinstance(payload, dict) and payload.get("error"):
+        message = payload["error"].get("message", payload["error"])
+        raise click.ClickException(str(message))
+    return payload.get("result", payload)
+
+
+def _call_admin(config: dict, method: str, params: dict) -> dict:
+    admin_token = os.environ.get(config.get("write", {}).get("server_secret_env", "HOARD_SERVER_SECRET"))
+    if not admin_token:
+        raise click.ClickException("HOARD_SERVER_SECRET is required for admin commands.")
+    return _call_mcp(config, method, params, token_override=admin_token)
 
 
 @click.group()
@@ -76,7 +111,10 @@ def init_command(
     console.print(f"✓ Database ready at {paths.db_path}")
 
     console.print("\nRunning initial sync...")
-    sync_command(config_path=path)
+    try:
+        sync_command(config_path=path)
+    except click.ClickException as exc:
+        console.print(f"[yellow]![/yellow] Sync skipped: {exc}")
 
     if run_setup:
         setup_command(
@@ -131,47 +169,8 @@ def add_command(
 def sync_command(config_path: Path | None) -> None:
     """Run sync for enabled connectors."""
     config = load_config(config_path)
-    paths = resolve_paths(config, config_path)
-    conn = connect(paths.db_path)
-    initialize_db(conn)
-
-    any_connector = False
-    progress = Progress(
-        TextColumn("{task.description}"),
-        BarColumn(),
-        TaskProgressColumn(),
-        TextColumn("{task.completed}/{task.total}"),
-        TimeRemainingColumn(),
-        transient=True,
-    )
-
-    with progress:
-        for name, connector, settings in iter_enabled_connectors(config):
-            any_connector = True
-            console.print(f"Syncing {name}...")
-            discover = connector.discover(settings)
-            if not discover.success:
-                console.print(f"  [red]Discover failed:[/red] {discover.message}")
-                continue
-
-            total = discover.entity_count_estimate or 0
-            task_id = progress.add_task(f"  Indexing {name}", total=total)
-
-            def _advance() -> None:
-                progress.advance(task_id)
-
-            stats = sync_connector(conn, connector, settings, on_entity=_advance)
-            progress.update(task_id, completed=stats.entities_seen)
-
-            console.print(
-                f"  Entities: {stats.entities_seen}, Chunks: {stats.chunks_written}, "
-                f"Tombstoned: {stats.entities_tombstoned}, Errors: {stats.errors}"
-            )
-
-    if not any_connector:
-        console.print("No enabled connectors found.")
-
-    conn.close()
+    result = _call_mcp(config, "tools/call", {"name": "sync_run", "arguments": {}})
+    console.print_json(json.dumps(result))
 
 
 @cli.command("search")
@@ -418,15 +417,14 @@ def memory_put_command(
     config_path: Path | None,
 ) -> None:
     config = load_config(config_path)
-    paths = resolve_paths(config, config_path)
-    conn = connect(paths.db_path)
-    initialize_db(conn)
-
     tag_list = [tag.strip() for tag in tags.split(",") if tag.strip()] if tags else []
     metadata_obj = json.loads(metadata) if metadata else None
-    entry = memory_put(conn, key=key, content=content, tags=tag_list, metadata=metadata_obj)
-    console.print_json(json.dumps(entry))
-    conn.close()
+    result = _call_mcp(
+        config,
+        "tools/call",
+        {"name": "memory_put", "arguments": {"key": key, "content": content, "tags": tag_list, "metadata": metadata_obj}},
+    )
+    console.print_json(json.dumps(result))
 
 
 @memory_group.command("get")
@@ -434,16 +432,12 @@ def memory_put_command(
 @click.option("--config", "config_path", type=click.Path(path_type=Path))
 def memory_get_command(key: str, config_path: Path | None) -> None:
     config = load_config(config_path)
-    paths = resolve_paths(config, config_path)
-    conn = connect(paths.db_path)
-    initialize_db(conn)
-
-    entry = memory_get(conn, key)
-    conn.close()
-    if not entry:
+    result = _call_mcp(config, "tools/call", {"name": "memory_get", "arguments": {"key": key}})
+    memory = result.get("memory")
+    if not memory:
         console.print("No entry found.")
         return
-    console.print_json(json.dumps(entry))
+    console.print_json(json.dumps(memory))
 
 
 @memory_group.command("search")
@@ -452,13 +446,12 @@ def memory_get_command(key: str, config_path: Path | None) -> None:
 @click.option("--config", "config_path", type=click.Path(path_type=Path))
 def memory_search_command(query: str, limit: int, config_path: Path | None) -> None:
     config = load_config(config_path)
-    paths = resolve_paths(config, config_path)
-    conn = connect(paths.db_path)
-    initialize_db(conn)
-
-    results = memory_search(conn, query, limit=limit)
-    conn.close()
-    console.print_json(json.dumps({"results": results}))
+    result = _call_mcp(
+        config,
+        "tools/call",
+        {"name": "memory_search", "arguments": {"query": query, "limit": limit}},
+    )
+    console.print_json(json.dumps(result))
 
 
 @cli.group("embeddings")
@@ -471,24 +464,12 @@ def embeddings_group() -> None:
 @click.option("--source", default=None, help="Filter by source name")
 def embeddings_build_command(config_path: Path | None, source: str | None) -> None:
     config = load_config(config_path)
-    paths = resolve_paths(config, config_path)
-    conn = connect(paths.db_path)
-    initialize_db(conn)
-
-    vectors_config = config.get("vectors", {})
-    model_name = vectors_config.get("model_name", "sentence-transformers/all-MiniLM-L6-v2")
-    batch_size = int(vectors_config.get("batch_size", 32))
-
-    try:
-        model = EmbeddingModel(model_name)
-    except EmbeddingError as exc:
-        console.print(f"[red]{exc}[/red]")
-        conn.close()
-        return
-
-    total = build_embeddings(conn, model, batch_size=batch_size, source=source)
-    console.print(f"Built {total} embeddings.")
-    conn.close()
+    result = _call_mcp(
+        config,
+        "tools/call",
+        {"name": "embeddings_build", "arguments": {"source": source}},
+    )
+    console.print_json(json.dumps(result))
 
 
 @cli.group("tokens")
@@ -503,31 +484,34 @@ def tokens_group() -> None:
 def tokens_add_command(name: str, scopes: str, config_path: Path | None) -> None:
     config = load_config(config_path)
     scope_list = [scope.strip() for scope in scopes.split(",") if scope.strip()]
-    token_value = f"hoard_sk_{secrets.token_hex(16)}"
-
-    security = config.setdefault("security", {})
-    tokens = security.setdefault("tokens", [])
-    tokens.append({"name": name, "token": token_value, "scopes": scope_list})
-
-    save_config(config, config_path)
-    console.print(f"Token created for {name}: {token_value}")
+    result = _call_admin(
+        config,
+        "tools/call",
+        {"name": "agent_register", "arguments": {"agent_id": name, "scopes": scope_list}},
+    )
+    console.print(f"Token created for {name}: {result.get('token')}")
 
 
 @tokens_group.command("list")
 @click.option("--config", "config_path", type=click.Path(path_type=Path))
 def tokens_list_command(config_path: Path | None) -> None:
     config = load_config(config_path)
-    tokens = config.get("security", {}).get("tokens", [])
+    result = _call_admin(config, "tools/call", {"name": "agent_list", "arguments": {}})
+    agents = result.get("agents", [])
 
-    table = Table(title="Tokens", show_header=True)
-    table.add_column("Name")
+    table = Table(title="Agents", show_header=True)
+    table.add_column("Agent")
     table.add_column("Scopes")
-    table.add_column("Token")
+    table.add_column("Sensitive")
+    table.add_column("Restricted")
 
-    for token in tokens:
-        token_value = token.get("token", "")
-        masked = f"{token_value[:6]}...{token_value[-4:]}" if token_value else ""
-        table.add_row(token.get("name", ""), ", ".join(token.get("scopes", [])), masked)
+    for agent in agents:
+        table.add_row(
+            agent.get("agent_id", ""),
+            ", ".join(agent.get("scopes", [])),
+            "yes" if agent.get("can_access_sensitive") else "no",
+            "yes" if agent.get("can_access_restricted") else "no",
+        )
 
     console.print(table)
 
@@ -537,11 +521,15 @@ def tokens_list_command(config_path: Path | None) -> None:
 @click.option("--config", "config_path", type=click.Path(path_type=Path))
 def tokens_remove_command(name: str, config_path: Path | None) -> None:
     config = load_config(config_path)
-    tokens = config.get("security", {}).get("tokens", [])
-    updated = [token for token in tokens if token.get("name") != name]
-    config.setdefault("security", {})["tokens"] = updated
-    save_config(config, config_path)
-    console.print(f"Removed token {name}.")
+    result = _call_admin(
+        config,
+        "tools/call",
+        {"name": "agent_remove", "arguments": {"agent_id": name}},
+    )
+    if result.get("success"):
+        console.print(f"Removed agent {name}.")
+    else:
+        console.print(f"Agent {name} not found.")
 
 
 @cli.group("connectors")
@@ -768,15 +756,14 @@ def setup_command(
     port = int(config.get("server", {}).get("port", 19850))
     url = f"http://{host}:{port}/mcp"
 
-    token_value = _ensure_token(config, name="default")
-    save_config(config, config_path)
-
     targets = _resolve_setup_targets(claude, codex, openclaw, setup_all)
     if not targets:
         console.print("No clients selected.")
         return
 
     _ensure_server_running(host, port)
+    token_value = _ensure_token(config, name="default")
+    save_config(config, config_path)
 
     if "claude" in targets:
         if project_scope:
@@ -1019,12 +1006,21 @@ def _detect_clients() -> List[str]:
 
 
 def _ensure_token(config: dict, name: str) -> str:
-    tokens = config.setdefault("security", {}).setdefault("tokens", [])
-    for token in tokens:
-        if token.get("name") == name:
-            return token.get("token")
-    token_value = f"hoard_sk_{secrets.token_hex(16)}"
-    tokens.append({"name": name, "token": token_value, "scopes": ["search", "get", "memory", "sync"]})
+    result = _call_admin(
+        config,
+        "tools/call",
+        {
+            "name": "agent_register",
+            "arguments": {
+                "agent_id": name,
+                "scopes": ["search", "get", "memory", "sync"],
+                "overwrite": True,
+            },
+        },
+    )
+    token_value = result.get("token")
+    if not token_value:
+        raise click.ClickException("Failed to provision token.")
     return token_value
 
 
@@ -1245,10 +1241,7 @@ def _verify_setup() -> None:
     config = load_config(None)
     host = config.get("server", {}).get("host", "127.0.0.1")
     port = int(config.get("server", {}).get("port", 19850))
-    token = None
-    tokens = config.get("security", {}).get("tokens", [])
-    if tokens:
-        token = tokens[0].get("token")
+    token = os.environ.get("HOARD_TOKEN")
 
     console.print("\nTier 1: Hoard Server Health")
     if _is_server_healthy(host, port):
@@ -1262,6 +1255,8 @@ def _verify_setup() -> None:
             console.print("  [green]✓[/green] Tools available")
         else:
             console.print("  [red]✗[/red] Tools list failed")
+    else:
+        console.print("  [yellow]![/yellow] HOARD_TOKEN not set; skipping tools check")
 
     console.print("\nTier 2: Client Configs")
     _check_file(Path.home() / ".claude.json", "Claude Code")

@@ -25,6 +25,7 @@ dependencies = [
     "click>=8.1",
     "rich>=13.7",
     "pyyaml>=6.0",
+    "argon2-cffi>=23.1.0",
 ]
 
 [project.optional-dependencies]

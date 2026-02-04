@@ -11,11 +11,11 @@ import click
 
 from hoard import __version__
 from hoard.core.config import load_config, resolve_paths
-from hoard.core.db.connection import connect
+from hoard.core.db.connection import connect, ensure_sqlite_version
 from hoard.migrations import migrate
-from hoard.core.mcp.tools import count_chunks, dispatch_tool, tool_definitions
-from hoard.core.security.audit import log_access
-from hoard.core.security.auth import AuthError, ScopeError, authenticate_token
+from hoard.core.mcp.tools import count_chunks, dispatch_tool, is_write_tool, tool_definitions
+from hoard.core.security.auth import authenticate_token
+from hoard.core.security.errors import AuthError, ScopeError
 from hoard.core.security.limits import RateLimitError, RateLimiter
 
 SUPPORTED_PROTOCOL_VERSIONS = ["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"]
@@ -130,34 +130,28 @@ class StdioMCPServer:
             return self._build_error(msg_id, -32000, "Missing auth token")
 
         conn = connect(self.db_path)
-        limiter = RateLimiter(conn, self.config, enforce=True)
+        limiter = RateLimiter(conn, self.config, enforce=False)
 
         try:
-            token = authenticate_token(token_value, self.config)
+            token = authenticate_token(token_value, self.config, conn)
+            if is_write_tool(tool_name):
+                return self._build_error(
+                    msg_id,
+                    -32004,
+                    "Write tools require hoard serve (HTTP).",
+                )
             limiter.check_request(token.name, tool_name)
             response = dispatch_tool(tool_name, arguments, conn, self.config, token)
             response_bytes = json.dumps(response).encode("utf-8")
             limiter.check_quota(token.name, count_chunks(response), len(response_bytes))
-            log_access(
-                conn,
-                tool=tool_name,
-                success=True,
-                token_name=token.name,
-                chunks_returned=count_chunks(response),
-                bytes_returned=len(response_bytes),
-            )
             return self._build_result(msg_id, response)
         except AuthError as exc:
-            log_access(conn, tool=tool_name, success=False, token_name=None)
             return self._build_error(msg_id, -32001, str(exc))
         except ScopeError as exc:
-            log_access(conn, tool=tool_name, success=False, token_name=token.name)
             return self._build_error(msg_id, -32002, str(exc))
         except RateLimitError as exc:
-            log_access(conn, tool=tool_name, success=False, token_name=token.name)
             return self._build_error(msg_id, -32003, str(exc))
         except Exception as exc:
-            log_access(conn, tool=tool_name, success=False, token_name=None)
             return self._build_error(msg_id, -32603, str(exc))
         finally:
             conn.close()
@@ -185,6 +179,7 @@ def run_stdio(config_path: Path | None = None) -> None:
 
     conn = connect(server.db_path)
     try:
+        ensure_sqlite_version()
         migrate(conn, app_version=__version__)
     except Exception as exc:
         click.echo(f"Failed to apply migrations: {exc}", err=True)

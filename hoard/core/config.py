@@ -68,6 +68,68 @@ DEFAULT_CONFIG = {
         "batch_size": 32,
         "prefilter_limit": 1000,
     },
+    "write": {
+        "enabled": True,
+        "server_secret_env": "HOARD_SERVER_SECRET",
+        "database": {
+            "busy_timeout_ms": 5000,
+        },
+        "slots": {
+            "pattern": "^(pref|fact|ctx|decision|event):[a-z0-9_]+(\\.[a-z0-9_]+){0,3}$",
+            "prefixes": ["pref", "fact", "ctx", "decision", "event"],
+            "on_invalid": "reject",
+        },
+        "embeddings": {
+            "enabled": True,
+            "active_model": {
+                "name": "sentence-transformers/all-MiniLM-L6-v2",
+                "version": "2.0.0",
+                "dimensions": 384,
+            },
+            "format": {
+                "dtype": "float32",
+                "byte_order": "little",
+                "normalization": "l2",
+            },
+        },
+        "proposals": {
+            "default_ttl_days": 7,
+            "max_ttl_days": 30,
+        },
+        "limits": {
+            "global": {"max_memories": 50000},
+            "per_agent": {"max_writes_per_hour": 100},
+            "retention": {
+                "default_ttl_days": 365,
+                "min_confidence_to_keep": 0.2,
+                "unused_decay_after_days": 90,
+            },
+        },
+        "worker": {
+            "mode": "process",
+            "poll_interval_ms": 1000,
+            "job_timeout_seconds": 60,
+            "lease_duration_seconds": 60,
+            "heartbeat_interval_seconds": 30,
+            "max_retries": 3,
+        },
+        "nli": {
+            "model": "cross-encoder/nli-deberta-v3-small",
+            "top_k": 5,
+            "contradiction_threshold": 0.7,
+        },
+        "sensitivity": {
+            "sensitive_max_ttl_days": 90,
+            "restricted_max_ttl_days": 30,
+        },
+        "query": {
+            "hybrid_weight_vector": 0.6,
+            "hybrid_weight_fts": 0.4,
+            "slot_match_bonus": 0.1,
+            "slot_only_baseline": 0.5,
+            "union_multiplier": 2,
+        },
+    },
     "storage": {
         "db_path": "~/.hoard/hoard.db",
     },
