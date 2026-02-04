@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from hoard.migrations import MigrationError, get_current_version, migrate
+from hoard.migrations import MigrationError, get_current_version, get_migrations, migrate
 
 
 def _migrate_process(db_path: str, result_queue: multiprocessing.Queue) -> None:
@@ -41,7 +41,8 @@ def test_incremental_upgrade(tmp_path: Path) -> None:
     assert get_current_version(conn) == 1
 
     migrate(conn)
-    assert get_current_version(conn) == 1
+    latest = max(get_migrations().keys()) if get_migrations() else 0
+    assert get_current_version(conn) == latest
     conn.close()
 
 
