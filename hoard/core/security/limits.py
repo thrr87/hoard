@@ -49,7 +49,29 @@ class RateLimiter:
     def _limit_key_for_tool(self, tool: str) -> Optional[str]:
         if tool in {"search"}:
             return "search_requests_per_minute"
-        if tool in {"get", "get_chunk", "memory_get", "memory_put", "memory_search", "sync_status"}:
+        if tool in {
+            "get",
+            "get_chunk",
+            "memory_get",
+            "memory_put",
+            "memory_search",
+            "memory_write",
+            "memory_query",
+            "memory_retract",
+            "memory_supersede",
+            "memory_propose",
+            "memory_review",
+            "conflicts_list",
+            "conflict_resolve",
+            "duplicates_list",
+            "duplicate_resolve",
+            "sync_status",
+            "sync_run",
+            "embeddings_build",
+            "agent_register",
+            "agent_list",
+            "agent_remove",
+        }:
             return "get_requests_per_minute"
         return None
 

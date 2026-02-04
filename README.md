@@ -20,7 +20,7 @@
 **Allowed / Supported**
 - Read-only indexing of local files, Obsidian vaults, and browser bookmarks.
 - Notion export ingestion (ZIP/HTML/CSV).
-- Local search, get, get_chunk, and memory tools.
+- Local search, get, get_chunk, and memory tools (read/write).
 - Trusted connectors (v1): install only what you trust.
 
 **Not in v1**
@@ -98,6 +98,24 @@ hoard serve --daemon
 hoard serve --status
 hoard serve --stop
 hoard serve --install-autostart
+```
+
+### Write Layer (v0.7)
+Cross-agent memory writes are supported via the HTTP server. Stdio mode is read-only.
+
+Requirements:
+- `HOARD_SERVER_SECRET` set in the environment (HMAC key for token lookup)
+- `hoard serve` running
+
+```bash
+export HOARD_SERVER_SECRET=$(python -c "import secrets; print(secrets.token_hex(32))")
+hoard serve
+```
+
+Admin tasks (token management) use the same secret:
+```bash
+export HOARD_SERVER_SECRET=...
+hoard tokens add claude-code --scopes search,get,memory,sync
 ```
 
 ### MCP Clients

@@ -1,22 +1,24 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Iterable, List, Set
+from typing import Iterable, List, Optional, Set
 
-
-class AuthError(Exception):
-    pass
-
-
-class ScopeError(Exception):
-    pass
+from hoard.core.security.agent_tokens import authenticate_agent
+from hoard.core.security.errors import AuthError, ScopeError
 
 
 @dataclass(frozen=True)
 class TokenInfo:
     name: str
-    token: str
+    token: Optional[str]
     scopes: Set[str]
+    capabilities: Set[str]
+    trust_level: float
+    can_access_sensitive: bool
+    can_access_restricted: bool
+    requires_user_confirm: bool
+    proposal_ttl_days: Optional[int]
+    rate_limit_per_hour: int
 
 
 def load_tokens(config: dict) -> List[TokenInfo]:
@@ -28,11 +30,39 @@ def load_tokens(config: dict) -> List[TokenInfo]:
         scopes = set(item.get("scopes", []))
         if not name or not token:
             continue
-        tokens.append(TokenInfo(name=name, token=token, scopes=scopes))
+        tokens.append(
+            TokenInfo(
+                name=name,
+                token=token,
+                scopes=scopes,
+                capabilities=scopes,
+                trust_level=0.5,
+                can_access_sensitive="sensitive" in scopes,
+                can_access_restricted="restricted" in scopes,
+                requires_user_confirm=False,
+                proposal_ttl_days=None,
+                rate_limit_per_hour=0,
+            )
+        )
     return tokens
 
 
-def authenticate_token(token_value: str, config: dict) -> TokenInfo:
+def authenticate_token(token_value: str, config: dict, conn=None) -> TokenInfo:
+    if conn is not None:
+        agent = authenticate_agent(conn, token_value, config)
+        return TokenInfo(
+            name=agent.agent_id,
+            token=None,
+            scopes=agent.scopes,
+            capabilities=agent.capabilities,
+            trust_level=agent.trust_level,
+            can_access_sensitive=agent.can_access_sensitive,
+            can_access_restricted=agent.can_access_restricted,
+            requires_user_confirm=agent.requires_user_confirm,
+            proposal_ttl_days=agent.proposal_ttl_days,
+            rate_limit_per_hour=agent.rate_limit_per_hour,
+        )
+
     for token in load_tokens(config):
         if token.token == token_value:
             return token
@@ -48,4 +78,4 @@ def require_scopes(token: TokenInfo, required: Iterable[str]) -> None:
 def can_access_sensitive(token: TokenInfo | None) -> bool:
     if token is None:
         return True
-    return "sensitive" in token.scopes
+    return bool(token.can_access_sensitive)

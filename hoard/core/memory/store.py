@@ -5,6 +5,10 @@ from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 from hoard.core.ingest.hash import compute_content_hash
+from hoard.core.memory.v2.store import MemoryError as V2MemoryError
+from hoard.core.memory.v2.store import memory_query as v2_memory_query
+from hoard.core.memory.v2.store import memory_write as v2_memory_write
+from hoard.core.security.auth import TokenInfo
 
 
 class MemoryError(Exception):
@@ -35,6 +39,23 @@ def memory_put(
 
     entry_id = compute_content_hash(f"memory:{key}")
     now = _now_iso()
+
+    source_context = json.dumps({"legacy_key": key, "metadata": metadata} if metadata else {"legacy_key": key})
+    try:
+        v2_memory_write(
+            conn,
+            memory_id=entry_id,
+            content=content,
+            memory_type="context",
+            scope_type="user",
+            scope_id=None,
+            source_agent="legacy",
+            source_context=source_context,
+            tags=tags,
+            config={},
+        )
+    except V2MemoryError:
+        pass
 
     conn.execute(
         """
@@ -68,35 +89,84 @@ def memory_get(conn, key: str) -> Optional[Dict[str, Any]]:
         "SELECT * FROM memory_entries WHERE key = ?",
         (key,),
     ).fetchone()
-    if not row:
+    if row:
+        return _row_to_entry(row)
+
+    legacy_key_match = f'\"legacy_key\": \"{key}\"'
+    memory_row = conn.execute(
+        "SELECT * FROM memories WHERE source_context LIKE ?",
+        (f"%{legacy_key_match}%",),
+    ).fetchone()
+    if not memory_row:
         return None
 
-    return _row_to_entry(row)
+    metadata = None
+    try:
+        ctx = json.loads(memory_row["source_context"]) if memory_row["source_context"] else {}
+        metadata = ctx.get("metadata")
+    except json.JSONDecodeError:
+        metadata = None
+
+    return {
+        "id": memory_row["id"],
+        "key": key,
+        "content": memory_row["content"],
+        "tags": [],
+        "metadata": metadata,
+        "created_at": memory_row["created_at"],
+        "updated_at": memory_row["created_at"],
+    }
 
 
 def memory_search(conn, query: str, limit: int = 20) -> List[Dict[str, Any]]:
     if not query.strip():
         return []
+    results = v2_memory_query(
+        conn,
+        params={"query": query, "limit": limit},
+        agent=_legacy_agent(),
+        config={},
+    ).get("results", [])
 
-    rows = conn.execute(
-        """
-        SELECT memory_entries.*,
-               -bm25(memory_fts) AS score
-        FROM memory_fts
-        JOIN memory_entries ON memory_fts.rowid = memory_entries.rowid
-        WHERE memory_fts MATCH ?
-        ORDER BY score DESC
-        LIMIT ?
-        """,
-        (query, limit),
-    ).fetchall()
+    output = []
+    for entry in results:
+        key = None
+        metadata = None
+        if entry.get("source_context"):
+            try:
+                ctx = json.loads(entry["source_context"])
+                key = ctx.get("legacy_key")
+                metadata = ctx.get("metadata")
+            except json.JSONDecodeError:
+                key = None
+        output.append(
+            {
+                "id": entry.get("id"),
+                "key": key or entry.get("id"),
+                "content": entry.get("content"),
+                "tags": entry.get("tags", []),
+                "metadata": metadata,
+                "created_at": entry.get("created_at"),
+                "updated_at": entry.get("created_at"),
+                "score": entry.get("score"),
+            }
+        )
+    return output
 
-    results = []
-    for row in rows:
-        entry = _row_to_entry(row)
-        entry["score"] = row["score"]
-        results.append(entry)
-    return results
+
+def _legacy_agent() -> TokenInfo:
+    return TokenInfo(
+        name="legacy",
+        token=None,
+        scopes={"memory"},
+        capabilities={"memory"},
+        trust_level=0.5,
+        can_access_sensitive=True,
+        can_access_restricted=True,
+        requires_user_confirm=False,
+        proposal_ttl_days=None,
+        rate_limit_per_hour=0,
+    )
 
 
 def _row_to_entry(row) -> Dict[str, Any]:
