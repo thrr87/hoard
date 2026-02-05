@@ -7,6 +7,7 @@ from typing import List, Tuple
 
 import pytest
 
+from hoard.core.db.connection import connect, initialize_db
 from hoard.core.mcp.server import MCPRequestHandler, MCPServer
 
 
@@ -16,6 +17,9 @@ def mcp_server() -> Callable[[Path], str]:
 
     def _start(config_path: Path) -> str:
         server = MCPServer(("127.0.0.1", 0), MCPRequestHandler, config_path)
+        conn = connect(server.db_path)
+        initialize_db(conn)
+        conn.close()
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
         servers.append((server, thread))
