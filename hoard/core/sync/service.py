@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import tempfile
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -104,7 +105,17 @@ def _stats_to_dict(stats: SyncStats) -> Dict[str, Any]:
 
 def _lock_path() -> Path:
     base = Path.home() / ".hoard"
-    base.mkdir(parents=True, exist_ok=True)
+    try:
+        base.mkdir(parents=True, exist_ok=True)
+    except PermissionError:
+        base = Path(tempfile.gettempdir()) / "hoard"
+        base.mkdir(parents=True, exist_ok=True)
+        return base / "sync.lock"
+
+    if not os.access(base, os.W_OK):
+        base = Path(tempfile.gettempdir()) / "hoard"
+        base.mkdir(parents=True, exist_ok=True)
+
     return base / "sync.lock"
 
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import os
 from typing import Iterable, List, Optional, Set
 
 from hoard.core.security.agent_tokens import authenticate_agent
@@ -48,7 +49,7 @@ def load_tokens(config: dict) -> List[TokenInfo]:
 
 
 def authenticate_token(token_value: str, config: dict, conn=None) -> TokenInfo:
-    if conn is not None:
+    if conn is not None and _server_secret_available(config):
         agent = authenticate_agent(conn, token_value, config)
         return TokenInfo(
             name=agent.agent_id,
@@ -67,6 +68,11 @@ def authenticate_token(token_value: str, config: dict, conn=None) -> TokenInfo:
         if token.token == token_value:
             return token
     raise AuthError("Invalid token")
+
+
+def _server_secret_available(config: dict) -> bool:
+    env_key = config.get("write", {}).get("server_secret_env", "HOARD_SERVER_SECRET")
+    return bool(env_key and os.environ.get(env_key))
 
 
 def require_scopes(token: TokenInfo, required: Iterable[str]) -> None:

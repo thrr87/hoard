@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import secrets
 import json
 import os
 import shutil
@@ -1180,21 +1181,37 @@ def _detect_clients() -> List[str]:
 
 
 def _ensure_token(config: dict, name: str) -> str:
-    result = _call_admin(
-        config,
-        "tools/call",
-        {
-            "name": "agent_register",
-            "arguments": {
-                "agent_id": name,
-                "scopes": ["search", "get", "memory", "sync", "ingest"],
-                "overwrite": True,
+    env_key = config.get("write", {}).get("server_secret_env", "HOARD_SERVER_SECRET")
+    if env_key and os.environ.get(env_key):
+        result = _call_admin(
+            config,
+            "tools/call",
+            {
+                "name": "agent_register",
+                "arguments": {
+                    "agent_id": name,
+                    "scopes": ["search", "get", "memory", "sync", "ingest"],
+                    "overwrite": True,
+                },
             },
-        },
+        )
+        token_value = result.get("token")
+        if not token_value:
+            raise click.ClickException("Failed to provision token.")
+        return token_value
+
+    tokens = config.setdefault("security", {}).setdefault("tokens", [])
+    for token in tokens:
+        if token.get("name") == name:
+            return token.get("token")
+    token_value = f"hoard_sk_{secrets.token_hex(16)}"
+    tokens.append(
+        {
+            "name": name,
+            "token": token_value,
+            "scopes": ["search", "get", "memory", "sync", "ingest"],
+        }
     )
-    token_value = result.get("token")
-    if not token_value:
-        raise click.ClickException("Failed to provision token.")
     return token_value
 
 

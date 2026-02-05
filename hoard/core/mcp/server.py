@@ -205,7 +205,10 @@ class MCPRequestHandler(BaseHTTPRequestHandler):
         chunks_returned: int = 0,
         bytes_returned: int = 0,
     ) -> None:
-        self.server.writer.submit(
+        writer = getattr(self.server, "writer", None)
+        if writer is None:
+            return
+        writer.submit(
             log_access,
             tool=tool,
             success=success,

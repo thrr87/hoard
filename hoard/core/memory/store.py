@@ -109,8 +109,16 @@ def memory_get(conn, key: str) -> Optional[Dict[str, Any]]:
 
     legacy_key_match = f'\"legacy_key\": \"{key}\"'
     memory_row = conn.execute(
-        "SELECT * FROM memories WHERE source_context LIKE ?",
-        (f"%{legacy_key_match}%",),
+        """
+        SELECT * FROM memories
+        WHERE source_context LIKE ?
+          AND (expires_at IS NULL OR expires_at > ?)
+          AND retracted_at IS NULL
+          AND superseded_at IS NULL
+        ORDER BY created_at DESC
+        LIMIT 1
+        """,
+        (f"%{legacy_key_match}%", _now_iso()),
     ).fetchone()
     if not memory_row:
         return None
