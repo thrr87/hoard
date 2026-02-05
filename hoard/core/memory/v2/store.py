@@ -11,14 +11,7 @@ from hoard.core.search.bm25 import _sanitize_fts_query
 from hoard.core.security.auth import TokenInfo
 
 
-_st_cache: dict[str, Any] = {}
-
-
-def _get_sentence_transformer(model_name: str):
-    if model_name not in _st_cache:
-        from sentence_transformers import SentenceTransformer
-        _st_cache[model_name] = SentenceTransformer(model_name)
-    return _st_cache[model_name]
+from hoard.core.memory.model_cache import get_sentence_transformer
 
 
 class MemoryError(Exception):
@@ -247,7 +240,7 @@ def memory_write(
 
     _insert_event(conn, memory_id=memory_id, event_type="created", actor=actor or source_agent)
 
-    _enqueue_job(conn, job_type="embed_memory", memory_id=memory_id, priority=0)
+    _enqueue_job(conn, job_type="embed_memory", memory_id=memory_id, priority=10)
     _enqueue_job(conn, job_type="detect_duplicates", memory_id=memory_id, priority=0)
     _enqueue_job(conn, job_type="detect_conflicts", memory_id=memory_id, priority=0)
 
@@ -579,7 +572,7 @@ def memory_query(
 
                 model_cfg = config.get("write", {}).get("embeddings", {}).get("active_model", {})
                 model_name = model_cfg.get("name", "sentence-transformers/all-MiniLM-L6-v2")
-                model = _get_sentence_transformer(model_name)
+                model = get_sentence_transformer(model_name)
                 query_vec = model.encode([query], normalize_embeddings=True)[0]
 
                 emb_rows = conn.execute(
