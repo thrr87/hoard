@@ -15,9 +15,6 @@ __pycache__/
 .claude/
 .benchmarks/
 
-# Local data
-/docs/
-
 # Logs / runtime
 .hoard/
 *.log

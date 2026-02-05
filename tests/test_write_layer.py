@@ -158,6 +158,42 @@ def test_restricted_slot_query(tmp_path: Path) -> None:
     conn.close()
 
 
+def test_restricted_memory_hidden_without_scope(tmp_path: Path) -> None:
+    db_path = tmp_path / "hoard.db"
+    conn = connect(db_path)
+    initialize_db(conn)
+
+    config = _test_config()
+    memory = memory_write(
+        conn,
+        content="Restricted memory",
+        memory_type="fact",
+        scope_type="user",
+        scope_id=None,
+        source_agent="tester",
+        sensitivity="restricted",
+        config=config,
+    )
+
+    limited_agent = TokenInfo(
+        name="limited",
+        token=None,
+        scopes={"memory"},
+        capabilities={"memory"},
+        trust_level=0.5,
+        can_access_sensitive=False,
+        can_access_restricted=False,
+        requires_user_confirm=False,
+        proposal_ttl_days=None,
+        rate_limit_per_hour=0,
+    )
+
+    result = memory_query(conn, params={"query": "Restricted", "limit": 5}, agent=limited_agent, config=config)
+    ids = [entry["id"] for entry in result.get("results", [])]
+    assert memory["id"] not in ids
+    conn.close()
+
+
 def test_slot_union_bounded(tmp_path: Path) -> None:
     db_path = tmp_path / "hoard.db"
     conn = connect(db_path)
