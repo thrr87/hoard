@@ -18,6 +18,7 @@ def search_chunks_flat(
         "SELECT chunks.id AS chunk_id, chunks.entity_id AS entity_id, chunks.content AS content, "
         "chunks.char_offset_start AS char_offset_start, chunks.char_offset_end AS char_offset_end, "
         "entities.title AS entity_title, entities.source AS source, entities.uri AS uri, "
+        "entities.updated_at AS entity_updated_at, "
         "-bm25(chunks_fts) AS score "
         "FROM chunks_fts "
         "JOIN chunks ON chunks_fts.rowid = chunks.rowid "
@@ -48,6 +49,7 @@ def search_chunks_flat(
             "entity_title": row["entity_title"],
             "source": row["source"],
             "uri": row["uri"],
+            "entity_updated_at": row["entity_updated_at"],
         }
         for row in rows
     ]
@@ -78,6 +80,7 @@ def search_chunks(
                 "entity_title": row["entity_title"],
                 "source": row["source"],
                 "uri": row["uri"],
+                "entity_updated_at": row["entity_updated_at"],
                 "chunks": [],
             }
         grouped[entity_id]["chunks"].append(
@@ -126,6 +129,7 @@ def search_entities_bm25(
                 "entity_title": row["entity_title"],
                 "source": row["source"],
                 "uri": row["uri"],
+                "entity_updated_at": row["entity_updated_at"],
                 "chunks": [],
             }
         if len(grouped[entity_id]["chunks"]) >= max_chunks_per_entity:

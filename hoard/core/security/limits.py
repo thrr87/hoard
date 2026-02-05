@@ -67,6 +67,8 @@ class RateLimiter:
             "duplicate_resolve",
             "sync_status",
             "sync_run",
+            "sync",
+            "inbox_put",
             "embeddings_build",
             "agent_register",
             "agent_list",

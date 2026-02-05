@@ -25,6 +25,13 @@ DEFAULT_CONFIG = {
             "chunk_max_tokens": 400,
             "chunk_overlap_tokens": 50,
         },
+        "inbox": {
+            "enabled": False,
+            "path": "",
+            "include_extensions": [".md", ".txt", ".csv", ".json", ".yaml", ".rst"],
+            "chunk_max_tokens": 400,
+            "chunk_overlap_tokens": 50,
+        },
         "obsidian": {
             "enabled": False,
             "vault_path": "~/Notes",
@@ -53,6 +60,11 @@ DEFAULT_CONFIG = {
     "sync": {
         "interval_minutes": 15,
         "watcher_enabled": False,
+        "watcher_debounce_seconds": 2,
+    },
+    "memory": {
+        "default_ttl_days": 30,
+        "prune_on_sync": True,
     },
     "search": {
         "rrf_k": 60,
@@ -175,6 +187,8 @@ def _expand_config_paths(config: Dict[str, Any]) -> Dict[str, Any]:
     for connector in connectors.values():
         if "paths" in connector and isinstance(connector["paths"], list):
             connector["paths"] = [_expand_path(p) for p in connector["paths"]]
+        if "path" in connector:
+            connector["path"] = _expand_path(connector["path"])
         if "vault_path" in connector:
             connector["vault_path"] = _expand_path(connector["vault_path"])
         if "export_path" in connector:

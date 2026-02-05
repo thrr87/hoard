@@ -151,6 +151,9 @@ class StdioMCPServer:
             return self._build_error(msg_id, -32002, str(exc))
         except RateLimitError as exc:
             return self._build_error(msg_id, -32003, str(exc))
+        except ValueError as exc:
+            log_access(conn, tool=tool_name, success=False, token_name=token.name)
+            return self._build_error(msg_id, -32601, str(exc))
         except Exception as exc:
             return self._build_error(msg_id, -32603, str(exc))
         finally:

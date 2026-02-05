@@ -40,7 +40,7 @@ class NotionExportConnector(ConnectorV1):
 
     @property
     def source_name(self) -> str:
-        return "notion"
+        return "notion_export"
 
     def discover(self, config: dict) -> DiscoverResult:
         export_path = _resolve_export_path(config)

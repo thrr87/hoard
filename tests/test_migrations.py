@@ -176,4 +176,36 @@ def test_checksum_stored(tmp_path: Path) -> None:
     assert rows
     for _, checksum in rows:
         assert len(checksum) == 16
+
+
+def test_notion_source_migration(tmp_path: Path) -> None:
+    db_path = tmp_path / "test.db"
+    conn = sqlite3.connect(db_path)
+
+    migrate(conn, target_version=3)
+    conn.execute(
+        """
+        INSERT INTO entities (id, source, source_id, entity_type, connector_name)
+        VALUES (?, ?, ?, ?, ?)
+        """,
+        ("notion-1", "notion", "abc", "page", "notion_export"),
+    )
+    conn.commit()
+
+    migrate(conn)
+    row = conn.execute(
+        "SELECT source FROM entities WHERE id = ?",
+        ("notion-1",),
+    ).fetchone()
+    assert row[0] == "notion_export"
+    conn.close()
+
+
+def test_memory_entries_expires_at_column(tmp_path: Path) -> None:
+    db_path = tmp_path / "test.db"
+    conn = sqlite3.connect(db_path)
+
+    migrate(conn)
+    columns = [row[1] for row in conn.execute("PRAGMA table_info(memory_entries)").fetchall()]
+    assert "expires_at" in columns
     conn.close()

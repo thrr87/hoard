@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional
 
 from hoard.core.ingest.hash import compute_content_hash
@@ -26,6 +26,9 @@ def memory_put(
     content: str,
     tags: Optional[List[str]] = None,
     metadata: Optional[Dict[str, Any]] = None,
+    ttl_days: Optional[int] = None,
+    expires_at: Optional[str] = None,
+    default_ttl_days: Optional[int] = None,
 ) -> Dict[str, Any]:
     if not key:
         raise MemoryError("Memory key is required")
@@ -39,6 +42,11 @@ def memory_put(
 
     entry_id = compute_content_hash(f"memory:{key}")
     now = _now_iso()
+    expires_value = _resolve_expires_at(
+        ttl_days=ttl_days,
+        expires_at=expires_at,
+        default_ttl_days=default_ttl_days,
+    )
 
     source_context = json.dumps({"legacy_key": key, "metadata": metadata} if metadata else {"legacy_key": key})
     try:
@@ -52,6 +60,7 @@ def memory_put(
             source_agent="legacy",
             source_context=source_context,
             tags=tags,
+            expires_at=expires_value,
             config={},
         )
     except V2MemoryError:
@@ -60,16 +69,17 @@ def memory_put(
     conn.execute(
         """
         INSERT INTO memory_entries (
-            id, key, content, tags, tags_text, metadata, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            id, key, content, tags, tags_text, metadata, created_at, updated_at, expires_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(key) DO UPDATE SET
             content = excluded.content,
             tags = excluded.tags,
             tags_text = excluded.tags_text,
             metadata = excluded.metadata,
-            updated_at = excluded.updated_at
+            updated_at = excluded.updated_at,
+            expires_at = excluded.expires_at
         """,
-        (entry_id, key, content, tags_json, tags_text, metadata_json, now, now),
+        (entry_id, key, content, tags_json, tags_text, metadata_json, now, now, expires_value),
     )
     conn.commit()
 
@@ -81,21 +91,34 @@ def memory_put(
         "metadata": metadata,
         "created_at": now,
         "updated_at": now,
+        "expires_at": expires_value,
     }
 
 
 def memory_get(conn, key: str) -> Optional[Dict[str, Any]]:
     row = conn.execute(
-        "SELECT * FROM memory_entries WHERE key = ?",
-        (key,),
+        """
+        SELECT * FROM memory_entries
+        WHERE key = ?
+          AND (expires_at IS NULL OR expires_at > ?)
+        """,
+        (key, _now_iso()),
     ).fetchone()
     if row:
         return _row_to_entry(row)
 
     legacy_key_match = f'\"legacy_key\": \"{key}\"'
     memory_row = conn.execute(
-        "SELECT * FROM memories WHERE source_context LIKE ?",
-        (f"%{legacy_key_match}%",),
+        """
+        SELECT * FROM memories
+        WHERE source_context LIKE ?
+          AND (expires_at IS NULL OR expires_at > ?)
+          AND retracted_at IS NULL
+          AND superseded_at IS NULL
+        ORDER BY created_at DESC
+        LIMIT 1
+        """,
+        (f"%{legacy_key_match}%", _now_iso()),
     ).fetchone()
     if not memory_row:
         return None
@@ -116,6 +139,19 @@ def memory_get(conn, key: str) -> Optional[Dict[str, Any]]:
         "created_at": memory_row["created_at"],
         "updated_at": memory_row["created_at"],
     }
+
+def memory_get_by_id(conn, entry_id: str) -> Optional[Dict[str, Any]]:
+    row = conn.execute(
+        """
+        SELECT * FROM memory_entries
+        WHERE id = ?
+          AND (expires_at IS NULL OR expires_at > ?)
+        """,
+        (entry_id, _now_iso()),
+    ).fetchone()
+    if not row:
+        return None
+    return _row_to_entry(row)
 
 
 def memory_search(conn, query: str, limit: int = 20) -> List[Dict[str, Any]]:
@@ -180,4 +216,42 @@ def _row_to_entry(row) -> Dict[str, Any]:
         "metadata": metadata,
         "created_at": row["created_at"],
         "updated_at": row["updated_at"],
+        "expires_at": row["expires_at"],
     }
+
+
+def memory_prune(conn) -> int:
+    now = _now_iso()
+    cursor = conn.execute(
+        "DELETE FROM memory_entries WHERE expires_at IS NOT NULL AND expires_at <= ?",
+        (now,),
+    )
+    conn.commit()
+    return cursor.rowcount
+
+
+def _resolve_expires_at(
+    *,
+    ttl_days: Optional[int],
+    expires_at: Optional[str],
+    default_ttl_days: Optional[int],
+) -> Optional[str]:
+    if expires_at:
+        return expires_at
+
+    if ttl_days is None:
+        ttl_days = default_ttl_days
+
+    if ttl_days is None:
+        return None
+
+    try:
+        ttl_days_int = int(ttl_days)
+    except (TypeError, ValueError) as exc:
+        raise MemoryError("Invalid ttl_days value") from exc
+
+    if ttl_days_int <= 0:
+        return _now_iso()
+
+    expires_dt = datetime.utcnow() + timedelta(days=ttl_days_int)
+    return expires_dt.isoformat(timespec="seconds")
