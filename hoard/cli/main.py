@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-import secrets
 import json
 import os
+import secrets
 import shutil
 import signal
 import subprocess
@@ -17,22 +17,31 @@ import click
 from rich.console import Console
 from rich.table import Table
 
+from hoard.cli.instructions import (
+    INSTRUCTION_END_MARKER,
+    INSTRUCTION_START_MARKER,
+    apply_change_plan,
+    build_change_plan,
+    compute_targets,
+    render_instruction_block,
+    resolve_project_root,
+)
 from hoard.core.config import ensure_config_file, load_config, resolve_paths, save_config
 from hoard.core.db.connection import connect, initialize_db
 from hoard.core.embeddings.model import EmbeddingError, EmbeddingModel
 from hoard.core.mcp.server import run_server
 from hoard.core.mcp.stdio import run_stdio
-from hoard.core.memory.store import memory_get, memory_put, memory_search, memory_prune
-from hoard.core.search.service import search_entities
-from hoard.core.sync.background import BackgroundSync
-from hoard.core.sync.service import run_sync_with_lock
-from hoard.core.sync.watcher import WATCHDOG_AVAILABLE
+from hoard.core.memory.store import memory_get, memory_prune, memory_put, memory_search
 from hoard.core.onboarding import (
     detect_chrome_bookmarks_paths,
     detect_document_folders,
     detect_notion_exports,
     detect_obsidian_vaults,
 )
+from hoard.core.search.service import search_entities
+from hoard.core.sync.background import BackgroundSync
+from hoard.core.sync.service import run_sync_with_lock
+from hoard.core.sync.watcher import WATCHDOG_AVAILABLE
 
 console = Console()
 
@@ -145,6 +154,7 @@ def init_command(
             project_scope=False,
             verify=False,
             uninstall=None,
+            no_instructions=False,
         )
 
 
@@ -327,7 +337,12 @@ def db_group() -> None:
 @db_group.command("status")
 @click.option("--config", "config_path", type=click.Path(path_type=Path))
 def db_status_command(config_path: Path | None) -> None:
-    from hoard.migrations import MigrationError, get_current_version, get_migrations, get_pending_versions
+    from hoard.migrations import (
+        MigrationError,
+        get_current_version,
+        get_migrations,
+        get_pending_versions,
+    )
 
     config = load_config(config_path)
     paths = resolve_paths(config, config_path)
@@ -399,7 +414,7 @@ def db_migrate_command(target_version: int | None, config_path: Path | None) -> 
         applied,
     ).fetchall()
     for row in rows:
-        version, name, duration_ms = row[0], row[1], row[2]
+        _, name, duration_ms = row[0], row[1], row[2]
         console.print(f"  {name} ... done ({duration_ms}ms)")
 
     console.print(f"Migrated from version {current} to {applied[-1]}")
@@ -669,7 +684,7 @@ def orchestrate_init_command(config_path: Path | None) -> None:
     save_config(config, config_path)
 
     env_key = config.get("orchestrator", {}).get("registration_token_env", "HOARD_REGISTRATION_TOKEN")
-    console.print(f"\n✓ Orchestration initialized.")
+    console.print("\n✓ Orchestration initialized.")
     console.print(f"Registration token stored in config. To use via env:\n  export {env_key}={token}")
     console.print("\nNext steps:")
     console.print("  1. Start server: hoard serve")
@@ -1217,6 +1232,65 @@ def mcp_stdio_command(config_path: Path | None) -> None:
     run_stdio(config_path=config_path)
 
 
+@cli.command("instructions")
+@click.option("--claude", is_flag=True, default=False, help="Update Claude project instructions")
+@click.option("--codex", is_flag=True, default=False, help="Update Codex project instructions")
+@click.option("--openclaw", is_flag=True, default=False, help="Update OpenClaw skill instructions")
+@click.option("--all", "instructions_all", is_flag=True, default=False, help="Update all targets")
+@click.option("--root", "root_path", type=click.Path(path_type=Path), default=None)
+@click.option("--dry-run", is_flag=True, default=False, help="Preview planned changes without writing")
+@click.option("--yes", "assume_yes", is_flag=True, default=False, help="Apply without confirmation")
+def instructions_command(
+    claude: bool,
+    codex: bool,
+    openclaw: bool,
+    instructions_all: bool,
+    root_path: Path | None,
+    dry_run: bool,
+    assume_yes: bool,
+) -> None:
+    targets = _resolve_instruction_targets(
+        claude=claude,
+        codex=codex,
+        openclaw=openclaw,
+        instructions_all=instructions_all,
+    )
+
+    project_required = any(target in {"claude", "codex"} for target in targets)
+    root = resolve_project_root(Path.cwd(), explicit_root=root_path) if project_required else None
+    if project_required and root is None:
+        flags = _instruction_target_flags(targets)
+        command = f"hoard instructions {flags} --root {Path.cwd()}"
+        raise click.ClickException(f"Could not determine project root.\nRun: {command}")
+
+    plans = compute_targets(root, targets)
+    block = render_instruction_block(_instruction_docs_url())
+    changes = build_change_plan(
+        plans,
+        block,
+        start_marker=INSTRUCTION_START_MARKER,
+        end_marker=INSTRUCTION_END_MARKER,
+    )
+    _print_instruction_plan(changes)
+
+    if dry_run:
+        console.print("Dry run complete. No files were changed.")
+        return
+
+    if not any(change.changed for change in changes):
+        console.print("Instruction files already up to date.")
+        return
+
+    if not assume_yes:
+        prompt = "Apply Hoard instruction updates to these files?"
+        if not click.confirm(prompt, default=True):
+            console.print("Instruction update canceled.")
+            return
+
+    result = apply_change_plan(changes)
+    console.print(f"Instruction update complete. Changed {len(result.applied)} file(s).")
+
+
 @cli.command("setup")
 @click.option("--claude", is_flag=True, default=False, help="Configure Claude Code")
 @click.option("--codex", is_flag=True, default=False, help="Configure Codex")
@@ -1225,6 +1299,7 @@ def mcp_stdio_command(config_path: Path | None) -> None:
 @click.option("--project-scope", is_flag=True, default=False, help="Use project-scope config for Claude")
 @click.option("--verify", is_flag=True, default=False, help="Verify integrations")
 @click.option("--uninstall", type=str, default=None, help="Uninstall client integration")
+@click.option("--no-instructions", is_flag=True, default=False, help="Skip instruction updates")
 def setup_command(
     claude: bool,
     codex: bool,
@@ -1233,6 +1308,7 @@ def setup_command(
     project_scope: bool,
     verify: bool,
     uninstall: str | None,
+    no_instructions: bool,
 ) -> None:
     if uninstall:
         _uninstall_integration(uninstall.lower())
@@ -1267,6 +1343,11 @@ def setup_command(
         _configure_codex(url)
     if "openclaw" in targets:
         _configure_openclaw(url, token_value)
+
+    if no_instructions:
+        console.print("Skipping instruction injection (--no-instructions).")
+    else:
+        _maybe_apply_instructions_for_setup(targets)
 
     console.print("Setup complete.")
 
@@ -1535,6 +1616,98 @@ def _detect_clients() -> List[str]:
     return targets
 
 
+def _resolve_instruction_targets(
+    *,
+    claude: bool,
+    codex: bool,
+    openclaw: bool,
+    instructions_all: bool,
+) -> List[str]:
+    if instructions_all:
+        return ["claude", "codex", "openclaw"]
+
+    targets: List[str] = []
+    if claude:
+        targets.append("claude")
+    if codex:
+        targets.append("codex")
+    if openclaw:
+        targets.append("openclaw")
+    if targets:
+        return targets
+    return ["claude", "codex", "openclaw"]
+
+
+def _instruction_target_flags(targets: List[str]) -> str:
+    flags = []
+    if "claude" in targets:
+        flags.append("--claude")
+    if "codex" in targets:
+        flags.append("--codex")
+    if "openclaw" in targets:
+        flags.append("--openclaw")
+    return " ".join(flags) if flags else "--all"
+
+
+def _instruction_docs_url() -> str:
+    return "https://github.com/thrr87/hoard/blob/main/README.md#additional-mcp-tools"
+
+
+def _print_instruction_plan(changes) -> None:
+    table = Table(title="Instruction updates")
+    table.add_column("Target")
+    table.add_column("Action")
+    table.add_column("Path")
+    for change in changes:
+        action = change.action if change.changed else "noop"
+        table.add_row(change.target, action, str(change.path))
+    console.print(table)
+
+
+def _is_interactive_session() -> bool:
+    return bool(sys.stdin.isatty())
+
+
+def _maybe_apply_instructions_for_setup(setup_targets: List[str]) -> None:
+    instruction_targets = [target for target in setup_targets if target in {"claude", "codex", "openclaw"}]
+    if not instruction_targets:
+        return
+
+    if not _is_interactive_session():
+        flags = _instruction_target_flags(instruction_targets)
+        console.print("Skipping instruction injection in non-interactive mode.")
+        console.print(f"Run: hoard instructions {flags} --root {Path.cwd()}")
+        return
+
+    root = resolve_project_root(Path.cwd()) if any(t in {"claude", "codex"} for t in instruction_targets) else None
+    if any(t in {"claude", "codex"} for t in instruction_targets) and root is None:
+        flags = _instruction_target_flags(instruction_targets)
+        console.print("Could not determine a project root for instruction injection.")
+        console.print(f"Run: hoard instructions {flags} --root {Path.cwd()}")
+        return
+
+    plans = compute_targets(root, instruction_targets)
+    block = render_instruction_block(_instruction_docs_url())
+    changes = build_change_plan(
+        plans,
+        block,
+        start_marker=INSTRUCTION_START_MARKER,
+        end_marker=INSTRUCTION_END_MARKER,
+    )
+
+    if not any(change.changed for change in changes):
+        console.print("Instruction files already up to date.")
+        return
+
+    _print_instruction_plan(changes)
+    if not click.confirm("Apply Hoard instruction updates to these files?", default=True):
+        console.print("Instruction update canceled.")
+        return
+
+    result = apply_change_plan(changes)
+    console.print(f"Instruction update complete. Changed {len(result.applied)} file(s).")
+
+
 def _ensure_token(config: dict, name: str) -> str:
     env_key = config.get("write", {}).get("server_secret_env", "HOARD_SERVER_SECRET")
     if env_key and os.environ.get(env_key):
@@ -1581,8 +1754,8 @@ def _ensure_server_running(host: str, port: int) -> None:
 
 
 def _is_server_healthy(host: str, port: int) -> bool:
-    import urllib.request
     import urllib.error
+    import urllib.request
 
     try:
         req = urllib.request.Request(
@@ -1689,10 +1862,12 @@ def _configure_openclaw(url: str, token: str) -> None:
 
 
 def _openclaw_skill_md() -> str:
-    return """---
+    block = render_instruction_block(_instruction_docs_url())
+    marked_block = f"{INSTRUCTION_START_MARKER}\n{block}\n{INSTRUCTION_END_MARKER}"
+    return f"""---
 name: hoard
 description: Search your Hoard knowledge base (local HTTP MCP)
-metadata: {"openclaw":{"requires":{"bins":["python3"],"env":["HOARD_URL","HOARD_TOKEN"]},"primaryEnv":"HOARD_TOKEN"}}
+metadata: {{"openclaw":{{"requires":{{"bins":["python3"],"env":["HOARD_URL","HOARD_TOKEN"]}},"primaryEnv":"HOARD_TOKEN"}}}}
 ---
 
 # Hoard
@@ -1705,29 +1880,48 @@ This skill expects:
 - `HOARD_TOKEN` (Bearer token)
 - `HOARD_URL` (default: http://127.0.0.1:19850)
 
+{marked_block}
+
 ## Commands
 
 Search:
 ```
-{baseDir}/scripts/hoard_client.py search "meeting notes" --limit 5
+{{baseDir}}/scripts/hoard_client.py search "meeting notes" --limit 5
 ```
 
 Get doc by id:
 ```
-{baseDir}/scripts/hoard_client.py get "abc123"
+{{baseDir}}/scripts/hoard_client.py get "abc123"
 ```
 
 Memory get:
 ```
-{baseDir}/scripts/hoard_client.py memory_get "some_key"
+{{baseDir}}/scripts/hoard_client.py memory_get "some_key"
+```
+
+Memory put:
+```
+{{baseDir}}/scripts/hoard_client.py memory_put "project.key" "value to remember"
+```
+
+Sync:
+```
+{{baseDir}}/scripts/hoard_client.py sync --source inbox
+```
+
+Inbox put:
+```
+{{baseDir}}/scripts/hoard_client.py inbox_put "Persist this note" --title "Note" --sync-immediately
 ```
 """
 
 
 def _openclaw_client_script() -> str:
     return """#!/usr/bin/env python3
+import argparse
 import os
 import json
+import sys
 import urllib.request
 import urllib.error
 
@@ -1751,33 +1945,108 @@ def _call_mcp(method: str, params: dict) -> dict:
         return {"error": str(exc)}
 
 
+def _call_tool(name: str, arguments: dict) -> dict:
+    return _call_mcp("tools/call", {"name": name, "arguments": arguments})
+
+
 def search(query: str, limit: int = 10) -> dict:
-    return _call_mcp("tools/call", {"name": "search", "arguments": {"query": query, "limit": limit}})
+    return _call_tool("search", {"query": query, "limit": limit})
 
 
 def get(entity_id: str) -> dict:
-    return _call_mcp("tools/call", {"name": "get", "arguments": {"entity_id": entity_id}})
+    return _call_tool("get", {"entity_id": entity_id})
 
 
 def memory_get(key: str) -> dict:
-    return _call_mcp("tools/call", {"name": "memory_get", "arguments": {"key": key}})
+    return _call_tool("memory_get", {"key": key})
+
+
+def memory_put(key: str, content: str, tags: list[str] | None = None) -> dict:
+    arguments = {"key": key, "content": content}
+    if tags:
+        arguments["tags"] = tags
+    return _call_tool("memory_put", arguments)
+
+
+def sync(source: str | None = None) -> dict:
+    arguments = {}
+    if source:
+        arguments["source"] = source
+    return _call_tool("sync", arguments)
+
+
+def inbox_put(
+    content: str,
+    title: str | None = None,
+    tags: list[str] | None = None,
+    sync_immediately: bool = False,
+) -> dict:
+    arguments = {"content": content, "sync_immediately": sync_immediately}
+    if title:
+        arguments["title"] = title
+    if tags:
+        arguments["tags"] = tags
+    return _call_tool("inbox_put", arguments)
+
+
+class HoardArgumentParser(argparse.ArgumentParser):
+    def error(self, message):
+        self.print_usage(sys.stderr)
+        self.exit(2, f"{self.prog}: error: {message}\\nTry '{self.prog} --help' for command examples.\\n")
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    parser = HoardArgumentParser(description="Hoard API client")
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    search_parser = subparsers.add_parser("search", help="Search indexed content")
+    search_parser.add_argument("query", help="Query string")
+    search_parser.add_argument("--limit", type=int, default=10, help="Result limit")
+
+    get_parser = subparsers.add_parser("get", help="Get full entity")
+    get_parser.add_argument("entity_id", help="Entity ID")
+
+    memory_get_parser = subparsers.add_parser("memory_get", help="Get memory by key")
+    memory_get_parser.add_argument("key", help="Memory key")
+
+    memory_put_parser = subparsers.add_parser("memory_put", help="Store memory")
+    memory_put_parser.add_argument("key", help="Memory key")
+    memory_put_parser.add_argument("content", help="Memory content")
+    memory_put_parser.add_argument("--tags", nargs="*", default=None, help="Optional memory tags")
+
+    sync_parser = subparsers.add_parser("sync", help="Run sync")
+    sync_parser.add_argument("--source", default=None, help="Optional source name")
+
+    inbox_put_parser = subparsers.add_parser("inbox_put", help="Write to inbox")
+    inbox_put_parser.add_argument("content", help="Inbox content")
+    inbox_put_parser.add_argument("--title", default=None, help="Optional title")
+    inbox_put_parser.add_argument("--tags", nargs="*", default=None, help="Optional tags")
+    inbox_put_parser.add_argument("--sync-immediately", is_flag=True, default=False)
+
+    return parser
 
 
 if __name__ == "__main__":
-    import argparse
-
-    parser = argparse.ArgumentParser(description="Hoard API client")
-    parser.add_argument("command", choices=["search", "get", "memory_get"])
-    parser.add_argument("value", help="Query string, entity ID, or memory key")
-    parser.add_argument("--limit", type=int, default=10, help="Result limit (search only)")
+    parser = _build_parser()
     args = parser.parse_args()
 
     if args.command == "search":
-        result = search(args.value, args.limit)
+        result = search(args.query, args.limit)
     elif args.command == "get":
-        result = get(args.value)
+        result = get(args.entity_id)
+    elif args.command == "memory_get":
+        result = memory_get(args.key)
+    elif args.command == "memory_put":
+        result = memory_put(args.key, args.content, tags=args.tags)
+    elif args.command == "sync":
+        result = sync(source=args.source)
     else:
-        result = memory_get(args.value)
+        result = inbox_put(
+            args.content,
+            title=args.title,
+            tags=args.tags,
+            sync_immediately=args.sync_immediately,
+        )
 
     print(json.dumps(result, indent=2))
 """
@@ -1821,8 +2090,8 @@ def _check_file(path: Path, label: str) -> None:
 
 
 def _check_tools_list(host: str, port: int, token: str) -> bool:
-    import urllib.request
     import urllib.error
+    import urllib.request
 
     try:
         req = urllib.request.Request(
