@@ -260,8 +260,15 @@ def memory_write(
     }
 
 
-def memory_get(conn, memory_id: str) -> Optional[Dict[str, Any]]:
-    row = conn.execute("SELECT * FROM memories WHERE id = ?", (memory_id,)).fetchone()
+def memory_get(conn, memory_id: str, agent: Optional[TokenInfo] = None) -> Optional[Dict[str, Any]]:
+    conditions, params = active_memory_conditions(_now_iso())
+    if agent:
+        conditions.extend(_build_sensitivity_conditions(agent))
+    where_clause = " AND ".join(conditions) if conditions else "1=1"
+    row = conn.execute(
+        f"SELECT * FROM memories WHERE id = ? AND {where_clause}",
+        (memory_id, *params),
+    ).fetchone()
     if not row:
         return None
     entry = _memory_row_to_dict(row)

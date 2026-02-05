@@ -15,20 +15,17 @@ from typing import List
 
 import click
 from rich.console import Console
-from rich.progress import BarColumn, Progress, TaskProgressColumn, TextColumn, TimeRemainingColumn
 from rich.table import Table
 
 from hoard.core.config import ensure_config_file, load_config, resolve_paths, save_config
 from hoard.core.db.connection import connect, initialize_db
 from hoard.core.embeddings.model import EmbeddingError, EmbeddingModel
-from hoard.core.ingest.registry import iter_enabled_connectors
-from hoard.core.ingest.sync import sync_connector
 from hoard.core.mcp.server import run_server
 from hoard.core.mcp.stdio import run_stdio
 from hoard.core.memory.store import memory_get, memory_put, memory_search, memory_prune
 from hoard.core.search.service import search_entities
 from hoard.core.sync.background import BackgroundSync
-from hoard.core.sync.service import acquire_sync_lock, release_sync_lock
+from hoard.core.sync.service import run_sync_with_lock
 from hoard.core.sync.watcher import WATCHDOG_AVAILABLE
 from hoard.core.onboarding import (
     detect_chrome_bookmarks_paths,
@@ -77,6 +74,21 @@ def _call_admin(config: dict, method: str, params: dict) -> dict:
     if not admin_token:
         raise click.ClickException("HOARD_SERVER_SECRET is required for admin commands.")
     return _call_mcp(config, method, params, token_override=admin_token)
+
+
+def _registration_token(config: dict) -> str | None:
+    env_key = config.get("orchestrator", {}).get("registration_token_env", "HOARD_REGISTRATION_TOKEN")
+    value = os.environ.get(env_key) if env_key else None
+    if value:
+        return value
+    return config.get("orchestrator", {}).get("registration_token")
+
+
+def _call_registration(config: dict, method: str, params: dict) -> dict:
+    token = _registration_token(config)
+    if not token:
+        raise click.ClickException("Registration token not configured. Run 'hoard orchestrate init'.")
+    return _call_mcp(config, method, params, token_override=token)
 
 
 @click.group()
@@ -185,60 +197,36 @@ def sync_command(config_path: Path | None) -> None:
 
 def _run_sync(config_path: Path | None) -> None:
     config = load_config(config_path)
-    paths = resolve_paths(config, config_path)
-    conn = connect(paths.db_path)
-    initialize_db(conn)
-    initialize_db(conn)
-
-    if not acquire_sync_lock():
+    result = run_sync_with_lock(config=config, config_path=config_path)
+    if result.get("skipped"):
         console.print("Sync already running.")
-        conn.close()
         return
 
-    any_connector = False
-    progress = Progress(
-        TextColumn("{task.description}"),
-        BarColumn(),
-        TaskProgressColumn(),
-        TextColumn("{task.completed}/{task.total}"),
-        TimeRemainingColumn(),
-        transient=True,
-    )
+    connectors = result.get("connectors", [])
+    if not connectors:
+        console.print("No enabled connectors found.")
+        return
 
-    try:
-        with progress:
-            for name, connector, settings in iter_enabled_connectors(config):
-                any_connector = True
-                console.print(f"Syncing {name}...")
-                discover = connector.discover(settings)
-                if not discover.success:
-                    console.print(f"  [red]Discover failed:[/red] {discover.message}")
-                    continue
+    for entry in connectors:
+        name = entry.get("source")
+        success = entry.get("success", False)
+        message = entry.get("message", "")
+        if not success:
+            console.print(f"Syncing {name}...")
+            console.print(f"  [red]Discover failed:[/red] {message}")
+            continue
+        stats = entry.get("stats") or {}
+        console.print(f"Syncing {name}...")
+        console.print(
+            f"  Entities: {stats.get('entities_seen', 0)}, "
+            f"Chunks: {stats.get('chunks_written', 0)}, "
+            f"Tombstoned: {stats.get('entities_tombstoned', 0)}, "
+            f"Errors: {stats.get('errors', 0)}"
+        )
 
-                total = discover.entity_count_estimate or 0
-                task_id = progress.add_task(f"  Indexing {name}", total=total)
-
-                def _advance() -> None:
-                    progress.advance(task_id)
-
-                stats = sync_connector(conn, connector, settings, on_entity=_advance)
-                progress.update(task_id, completed=stats.entities_seen)
-
-                console.print(
-                    f"  Entities: {stats.entities_seen}, Chunks: {stats.chunks_written}, "
-                    f"Tombstoned: {stats.entities_tombstoned}, Errors: {stats.errors}"
-                )
-
-        if not any_connector:
-            console.print("No enabled connectors found.")
-
-        if config.get("memory", {}).get("prune_on_sync", True):
-            removed = memory_prune(conn)
-            if removed:
-                console.print(f"Pruned {removed} expired memory entries.")
-    finally:
-        release_sync_lock()
-        conn.close()
+    pruned = result.get("memory_pruned", 0)
+    if pruned:
+        console.print(f"Pruned {pruned} expired memory entries.")
 
 
 @cli.command("search")
@@ -556,7 +544,7 @@ def memory_search_command(query: str, limit: int, config_path: Path | None) -> N
     conn = connect(paths.db_path)
     initialize_db(conn)
 
-    results = memory_search(conn, query, limit=limit)
+    results = memory_search(conn, query, limit=limit, config=config)
     conn.close()
     console.print_json(json.dumps({"results": results}))
 
@@ -650,6 +638,373 @@ def tokens_remove_command(name: str, config_path: Path | None) -> None:
         console.print(f"Removed agent {name}.")
     else:
         console.print(f"Agent {name} not found.")
+
+
+@cli.group("orchestrate")
+def orchestrate_group() -> None:
+    """Orchestration setup."""
+
+
+@orchestrate_group.command("init")
+@click.option("--config", "config_path", type=click.Path(path_type=Path))
+def orchestrate_init_command(config_path: Path | None) -> None:
+    config_path = ensure_config_file(config_path)
+    config = load_config(config_path)
+
+    orchestrator = config.setdefault("orchestrator", {})
+    token = orchestrator.get("registration_token")
+    if not token:
+        token = f"hoard_reg_{secrets.token_hex(16)}"
+        orchestrator["registration_token"] = token
+
+    artifacts = config.setdefault("artifacts", {})
+    default_path = artifacts.get("blob_path") or str(Path.home() / ".hoard" / "artifacts")
+    blob_path = click.prompt("Artifact store path", default=default_path)
+    artifacts["blob_path"] = blob_path
+
+    default_retention = int(artifacts.get("retention_days") or 30)
+    retention_days = click.prompt("Artifact retention days", default=default_retention)
+    artifacts["retention_days"] = int(retention_days)
+
+    save_config(config, config_path)
+
+    env_key = config.get("orchestrator", {}).get("registration_token_env", "HOARD_REGISTRATION_TOKEN")
+    console.print(f"\n✓ Orchestration initialized.")
+    console.print(f"Registration token stored in config. To use via env:\n  export {env_key}={token}")
+    console.print("\nNext steps:")
+    console.print("  1. Start server: hoard serve")
+    console.print("  2. Register agents: hoard agent register <name> --type worker")
+
+
+@cli.group("agent")
+def agent_group() -> None:
+    """Manage orchestration agents."""
+
+
+@agent_group.command("register")
+@click.argument("name", type=str)
+@click.option("--type", "agent_type", default="worker")
+@click.option("--scopes", default="", help="Comma-separated scopes")
+@click.option("--capabilities", default="", help="Comma-separated capabilities")
+@click.option("--config", "config_path", type=click.Path(path_type=Path))
+def agent_register_command(
+    name: str,
+    agent_type: str,
+    scopes: str,
+    capabilities: str,
+    config_path: Path | None,
+) -> None:
+    config = load_config(config_path)
+    scope_list = [s.strip() for s in scopes.split(",") if s.strip()] if scopes else None
+    cap_list = [s.strip() for s in capabilities.split(",") if s.strip()] if capabilities else None
+    result = _call_registration(
+        config,
+        "tools/call",
+        {
+            "name": "agent.register",
+            "arguments": {
+                "name": name,
+                "agent_type": agent_type,
+                "scopes": scope_list,
+                "capabilities": cap_list,
+            },
+        },
+    )
+    console.print_json(json.dumps(result))
+
+
+@agent_group.command("list")
+@click.option("--config", "config_path", type=click.Path(path_type=Path))
+def agent_list_command(config_path: Path | None) -> None:
+    config = load_config(config_path)
+    result = _call_mcp(config, "tools/call", {"name": "agent.list", "arguments": {}})
+    console.print_json(json.dumps(result))
+
+
+@agent_group.command("deregister")
+@click.argument("agent_id", type=str)
+@click.option("--config", "config_path", type=click.Path(path_type=Path))
+def agent_deregister_command(agent_id: str, config_path: Path | None) -> None:
+    config = load_config(config_path)
+    result = _call_mcp(
+        config,
+        "tools/call",
+        {"name": "agent.deregister", "arguments": {"agent_id": agent_id}},
+    )
+    console.print_json(json.dumps(result))
+
+
+@cli.group("task")
+def task_group() -> None:
+    """Manage orchestration tasks."""
+
+
+@task_group.command("create")
+@click.argument("name", type=str)
+@click.option("--description", default=None)
+@click.option("--capability", "requires_capability", default=None)
+@click.option("--priority", default=5, type=int)
+@click.option("--config", "config_path", type=click.Path(path_type=Path))
+def task_create_command(
+    name: str,
+    description: str | None,
+    requires_capability: str | None,
+    priority: int,
+    config_path: Path | None,
+) -> None:
+    config = load_config(config_path)
+    result = _call_mcp(
+        config,
+        "tools/call",
+        {
+            "name": "task.create",
+            "arguments": {
+                "name": name,
+                "description": description,
+                "requires_capability": requires_capability,
+                "priority": priority,
+            },
+        },
+    )
+    console.print_json(json.dumps(result))
+
+
+@task_group.command("list")
+@click.option("--status", default=None)
+@click.option("--config", "config_path", type=click.Path(path_type=Path))
+def task_list_command(status: str | None, config_path: Path | None) -> None:
+    config = load_config(config_path)
+    result = _call_mcp(
+        config,
+        "tools/call",
+        {"name": "task.list", "arguments": {"status": status}},
+    )
+    console.print_json(json.dumps(result))
+
+
+@task_group.command("poll")
+@click.option("--limit", default=5, type=int)
+@click.option("--config", "config_path", type=click.Path(path_type=Path))
+def task_poll_command(limit: int, config_path: Path | None) -> None:
+    config = load_config(config_path)
+    result = _call_mcp(
+        config,
+        "tools/call",
+        {"name": "task.poll", "arguments": {"limit": limit}},
+    )
+    console.print_json(json.dumps(result))
+
+
+@task_group.command("claim")
+@click.argument("task_id", type=str)
+@click.option("--config", "config_path", type=click.Path(path_type=Path))
+def task_claim_command(task_id: str, config_path: Path | None) -> None:
+    config = load_config(config_path)
+    result = _call_mcp(
+        config,
+        "tools/call",
+        {"name": "task.claim", "arguments": {"task_id": task_id}},
+    )
+    console.print_json(json.dumps(result))
+
+
+@task_group.command("complete")
+@click.argument("task_id", type=str)
+@click.option("--summary", default=None)
+@click.option("--artifact", "output_artifact_id", default=None)
+@click.option("--config", "config_path", type=click.Path(path_type=Path))
+def task_complete_command(task_id: str, summary: str | None, output_artifact_id: str | None, config_path: Path | None) -> None:
+    config = load_config(config_path)
+    result = _call_mcp(
+        config,
+        "tools/call",
+        {
+            "name": "task.complete",
+            "arguments": {"task_id": task_id, "output_summary": summary, "output_artifact_id": output_artifact_id},
+        },
+    )
+    console.print_json(json.dumps(result))
+
+
+@cli.group("artifact")
+def artifact_group() -> None:
+    """Manage task artifacts."""
+
+
+@artifact_group.command("put")
+@click.argument("task_id", type=str)
+@click.argument("name", type=str)
+@click.option("--type", "artifact_type", default="text")
+@click.option("--content", default=None)
+@click.option("--config", "config_path", type=click.Path(path_type=Path))
+def artifact_put_command(task_id: str, name: str, artifact_type: str, content: str | None, config_path: Path | None) -> None:
+    config = load_config(config_path)
+    result = _call_mcp(
+        config,
+        "tools/call",
+        {
+            "name": "artifact.put",
+            "arguments": {"task_id": task_id, "name": name, "artifact_type": artifact_type, "content": content},
+        },
+    )
+    console.print_json(json.dumps(result))
+
+
+@artifact_group.command("get")
+@click.argument("artifact_id", type=str)
+@click.option("--include-content", is_flag=True, default=False)
+@click.option("--config", "config_path", type=click.Path(path_type=Path))
+def artifact_get_command(artifact_id: str, include_content: bool, config_path: Path | None) -> None:
+    config = load_config(config_path)
+    result = _call_mcp(
+        config,
+        "tools/call",
+        {"name": "artifact.get", "arguments": {"artifact_id": artifact_id, "include_content": include_content}},
+    )
+    console.print_json(json.dumps(result))
+
+
+@cli.group("event")
+def event_group() -> None:
+    """Manage events."""
+
+
+@event_group.command("poll")
+@click.option("--since", default=None)
+@click.option("--limit", default=50, type=int)
+@click.option("--config", "config_path", type=click.Path(path_type=Path))
+def event_poll_command(since: str | None, limit: int, config_path: Path | None) -> None:
+    config = load_config(config_path)
+    result = _call_mcp(
+        config,
+        "tools/call",
+        {"name": "event.poll", "arguments": {"since": since, "limit": limit}},
+    )
+    console.print_json(json.dumps(result))
+
+
+@cli.group("cost")
+def cost_group() -> None:
+    """Cost reporting."""
+
+
+@cost_group.command("summary")
+@click.option("--period", default="today")
+@click.option("--config", "config_path", type=click.Path(path_type=Path))
+def cost_summary_command(period: str, config_path: Path | None) -> None:
+    config = load_config(config_path)
+    result = _call_mcp(
+        config,
+        "tools/call",
+        {"name": "cost.summary", "arguments": {"period": period}},
+    )
+    console.print_json(json.dumps(result))
+
+
+@cli.group("workflow")
+def workflow_group() -> None:
+    """Manage workflows."""
+
+
+@workflow_group.command("list")
+@click.option("--status", default=None)
+@click.option("--config", "config_path", type=click.Path(path_type=Path))
+def workflow_list_command(status: str | None, config_path: Path | None) -> None:
+    config = load_config(config_path)
+    result = _call_mcp(
+        config,
+        "tools/call",
+        {"name": "workflow.list", "arguments": {"status": status}},
+    )
+    console.print_json(json.dumps(result))
+
+
+@workflow_group.command("create")
+@click.argument("name", type=str)
+@click.option("--definition", "definition_path", type=click.Path(path_type=Path), required=True)
+@click.option("--config", "config_path", type=click.Path(path_type=Path))
+def workflow_create_command(name: str, definition_path: Path, config_path: Path | None) -> None:
+    config = load_config(config_path)
+    definition = json.loads(definition_path.read_text())
+    result = _call_mcp(
+        config,
+        "tools/call",
+        {"name": "workflow.create", "arguments": {"name": name, "definition": definition}},
+    )
+    console.print_json(json.dumps(result))
+
+
+@workflow_group.command("start")
+@click.argument("workflow_id", type=str)
+@click.option("--config", "config_path", type=click.Path(path_type=Path))
+def workflow_start_command(workflow_id: str, config_path: Path | None) -> None:
+    config = load_config(config_path)
+    result = _call_mcp(
+        config,
+        "tools/call",
+        {"name": "workflow.start", "arguments": {"workflow_id": workflow_id}},
+    )
+    console.print_json(json.dumps(result))
+
+
+@workflow_group.command("status")
+@click.argument("workflow_id", type=str)
+@click.option("--config", "config_path", type=click.Path(path_type=Path))
+def workflow_status_command(workflow_id: str, config_path: Path | None) -> None:
+    config = load_config(config_path)
+    result = _call_mcp(
+        config,
+        "tools/call",
+        {"name": "workflow.status", "arguments": {"workflow_id": workflow_id}},
+    )
+    console.print_json(json.dumps(result))
+
+
+@event_group.command("publish")
+@click.argument("event_type", type=str)
+@click.option("--payload", default="{}", help="JSON payload")
+@click.option("--config", "config_path", type=click.Path(path_type=Path))
+def event_publish_command(event_type: str, payload: str, config_path: Path | None) -> None:
+    config = load_config(config_path)
+    payload_obj = json.loads(payload) if payload else {}
+    result = _call_mcp(
+        config,
+        "tools/call",
+        {"name": "event.publish", "arguments": {"event_type": event_type, "payload": payload_obj}},
+    )
+    console.print_json(json.dumps(result))
+
+
+@cost_group.command("budget")
+@click.option("--agent", "agent_id", default=None)
+@click.option("--workflow", "workflow_id", default=None)
+@click.option("--period", default="today")
+@click.option("--config", "config_path", type=click.Path(path_type=Path))
+def cost_budget_command(agent_id: str | None, workflow_id: str | None, period: str, config_path: Path | None) -> None:
+    config = load_config(config_path)
+    result = _call_mcp(
+        config,
+        "tools/call",
+        {
+            "name": "cost.budget",
+            "arguments": {"agent_id": agent_id, "workflow_id": workflow_id, "period": period},
+        },
+    )
+    console.print_json(json.dumps(result))
+
+
+@artifact_group.command("list")
+@click.option("--task", "task_id", default=None)
+@click.option("--workflow", "workflow_id", default=None)
+@click.option("--config", "config_path", type=click.Path(path_type=Path))
+def artifact_list_command(task_id: str | None, workflow_id: str | None, config_path: Path | None) -> None:
+    config = load_config(config_path)
+    result = _call_mcp(
+        config,
+        "tools/call",
+        {"name": "artifact.list", "arguments": {"task_id": task_id, "workflow_id": workflow_id}},
+    )
+    console.print_json(json.dumps(result))
 
 
 @cli.group("connectors")

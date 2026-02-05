@@ -154,14 +154,21 @@ def memory_get_by_id(conn, entry_id: str) -> Optional[Dict[str, Any]]:
     return _row_to_entry(row)
 
 
-def memory_search(conn, query: str, limit: int = 20) -> List[Dict[str, Any]]:
+def memory_search(
+    conn,
+    query: str,
+    limit: int = 20,
+    *,
+    agent: Optional[TokenInfo] = None,
+    config: Optional[dict] = None,
+) -> List[Dict[str, Any]]:
     if not query.strip():
         return []
     results = v2_memory_query(
         conn,
         params={"query": query, "limit": limit},
-        agent=_legacy_agent(),
-        config={},
+        agent=agent or _legacy_agent(),
+        config=config or {},
     ).get("results", [])
 
     output = []

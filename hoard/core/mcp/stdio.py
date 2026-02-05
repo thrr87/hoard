@@ -15,6 +15,7 @@ from hoard.core.db.connection import connect, ensure_sqlite_version
 from hoard.migrations import migrate
 from hoard.core.mcp.tools import count_chunks, dispatch_tool, is_write_tool, tool_definitions
 from hoard.core.security.auth import authenticate_token
+from hoard.core.security.audit import log_access
 from hoard.core.security.errors import AuthError, ScopeError
 from hoard.core.security.limits import RateLimitError, RateLimiter
 

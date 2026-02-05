@@ -38,6 +38,7 @@
 - Notion export ingestion (ZIP/HTML/CSV).
 - Agent inbox (drop folder) + MCP ingestion.
 - Local search, get, get_chunk, sync, and memory tools (read/write).
+- Agent orchestration (registry, tasks, artifacts, events, costs).
 - Trusted connectors (v1): install only what you trust.
 
 **Not in v1**
@@ -97,6 +98,16 @@ hoard add --obsidian <path>
 hoard add --notion <path>
 ```
 
+### Orchestration
+```bash
+hoard orchestrate init     # generate registration token + artifact config
+hoard agent register <name> --type worker
+hoard task create "Research X"
+hoard task list
+hoard artifact put <task-id> report.md --type text --content "..."
+hoard event poll
+```
+
 ### Sync & Search
 ```bash
 hoard sync
@@ -120,6 +131,7 @@ hoard embeddings build
 ### Server
 ```bash
 hoard serve                # HTTP MCP server (http://127.0.0.1:19850/mcp)
+                         # SSE events: http://127.0.0.1:19850/events
 hoard serve --daemon
 hoard serve --status
 hoard serve --stop
