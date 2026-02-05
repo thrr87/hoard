@@ -264,14 +264,17 @@ class Worker:
                 return
             query_vec = list(query_arr)
 
+            now = datetime.utcnow().isoformat(timespec="seconds")
+            src_conditions, src_params = active_memory_conditions(now, table_alias="m")
+            src_conditions.append("m.id = ?")
+            src_params.append(memory_id)
+            src_where = " AND ".join(src_conditions)
             mem_row = conn.execute(
-                "SELECT scope_type, scope_id FROM memories WHERE id = ?",
-                (memory_id,),
+                f"SELECT m.scope_type, m.scope_id FROM memories m WHERE {src_where}",
+                src_params,
             ).fetchone()
             if not mem_row:
                 return
-
-            now = datetime.utcnow().isoformat(timespec="seconds")
             conditions, params = active_memory_conditions(now)
             conditions.append("m.id != ?")
             params.append(memory_id)
@@ -347,9 +350,14 @@ class Worker:
     def _process_conflicts(self, memory_id: str) -> None:
         conn = connect(self._db_path)
         try:
+            now = datetime.utcnow().isoformat(timespec="seconds")
+            src_conditions, src_params = active_memory_conditions(now, table_alias="m")
+            src_conditions.append("m.id = ?")
+            src_params.append(memory_id)
+            src_where = " AND ".join(src_conditions)
             mem_row = conn.execute(
-                "SELECT slot, scope_type, scope_id FROM memories WHERE id = ?",
-                (memory_id,),
+                f"SELECT m.slot, m.scope_type, m.scope_id FROM memories m WHERE {src_where}",
+                src_params,
             ).fetchone()
             if not mem_row or not mem_row["slot"]:
                 return

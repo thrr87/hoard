@@ -410,3 +410,62 @@ def test_conflict_detection_null_scope_id(tmp_path: Path) -> None:
 
     conn.close()
     writer.stop()
+
+
+def test_duplicate_detection_skips_retracted_source(tmp_path: Path) -> None:
+    db_path = tmp_path / "hoard.db"
+    conn = connect(db_path)
+    initialize_db(conn)
+
+    writer = WriteCoordinator(db_path=db_path)
+    worker = Worker(db_path=db_path, config=_detection_config(), writer=writer)
+
+    mid1 = str(uuid.uuid4())
+    mid2 = str(uuid.uuid4())
+    blob = _make_embedding([0.5, 0.5, 0.5, 0.5])
+
+    _insert_memory(conn, mid1, "content A")
+    _insert_memory(conn, mid2, "content A")
+    _insert_embedding(conn, mid1, blob)
+    _insert_embedding(conn, mid2, blob)
+
+    # Retract the source memory
+    now = datetime.utcnow().isoformat(timespec="seconds")
+    conn.execute("UPDATE memories SET retracted_at = ? WHERE id = ?", (now, mid2))
+    conn.commit()
+
+    worker._process_duplicates(mid2)
+
+    dup_rows = conn.execute("SELECT * FROM memory_duplicates").fetchall()
+    assert len(dup_rows) == 0
+
+    conn.close()
+    writer.stop()
+
+
+def test_conflict_detection_skips_retracted_source(tmp_path: Path) -> None:
+    db_path = tmp_path / "hoard.db"
+    conn = connect(db_path)
+    initialize_db(conn)
+
+    writer = WriteCoordinator(db_path=db_path)
+    worker = Worker(db_path=db_path, config=_detection_config(), writer=writer)
+
+    mid1 = str(uuid.uuid4())
+    mid2 = str(uuid.uuid4())
+
+    _insert_memory(conn, mid1, "value A", slot="fact:test.key", scope_type="user")
+    _insert_memory(conn, mid2, "value B", slot="fact:test.key", scope_type="user")
+
+    # Retract the source memory
+    now = datetime.utcnow().isoformat(timespec="seconds")
+    conn.execute("UPDATE memories SET retracted_at = ? WHERE id = ?", (now, mid2))
+    conn.commit()
+
+    worker._process_conflicts(mid2)
+
+    conflict_rows = conn.execute("SELECT * FROM memory_conflicts").fetchall()
+    assert len(conflict_rows) == 0
+
+    conn.close()
+    writer.stop()
