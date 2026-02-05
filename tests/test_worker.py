@@ -443,6 +443,64 @@ def test_duplicate_detection_skips_retracted_source(tmp_path: Path) -> None:
     writer.stop()
 
 
+def test_duplicate_detection_skips_superseded_source(tmp_path: Path) -> None:
+    db_path = tmp_path / "hoard.db"
+    conn = connect(db_path)
+    initialize_db(conn)
+
+    writer = WriteCoordinator(db_path=db_path)
+    worker = Worker(db_path=db_path, config=_detection_config(), writer=writer)
+
+    mid1 = str(uuid.uuid4())
+    mid2 = str(uuid.uuid4())
+    blob = _make_embedding([0.5, 0.5, 0.5, 0.5])
+
+    _insert_memory(conn, mid1, "content A")
+    _insert_memory(conn, mid2, "content A")
+    _insert_embedding(conn, mid1, blob)
+    _insert_embedding(conn, mid2, blob)
+
+    now = datetime.utcnow().isoformat(timespec="seconds")
+    conn.execute("UPDATE memories SET superseded_by = ?, superseded_at = ? WHERE id = ?", (mid1, now, mid2))
+    conn.commit()
+
+    worker._process_duplicates(mid2)
+
+    assert conn.execute("SELECT count(*) FROM memory_duplicates").fetchone()[0] == 0
+
+    conn.close()
+    writer.stop()
+
+
+def test_duplicate_detection_skips_expired_source(tmp_path: Path) -> None:
+    db_path = tmp_path / "hoard.db"
+    conn = connect(db_path)
+    initialize_db(conn)
+
+    writer = WriteCoordinator(db_path=db_path)
+    worker = Worker(db_path=db_path, config=_detection_config(), writer=writer)
+
+    mid1 = str(uuid.uuid4())
+    mid2 = str(uuid.uuid4())
+    blob = _make_embedding([0.5, 0.5, 0.5, 0.5])
+
+    _insert_memory(conn, mid1, "content A")
+    _insert_memory(conn, mid2, "content A")
+    _insert_embedding(conn, mid1, blob)
+    _insert_embedding(conn, mid2, blob)
+
+    past = (datetime.utcnow() - timedelta(hours=1)).isoformat(timespec="seconds")
+    conn.execute("UPDATE memories SET expires_at = ? WHERE id = ?", (past, mid2))
+    conn.commit()
+
+    worker._process_duplicates(mid2)
+
+    assert conn.execute("SELECT count(*) FROM memory_duplicates").fetchone()[0] == 0
+
+    conn.close()
+    writer.stop()
+
+
 def test_conflict_detection_skips_retracted_source(tmp_path: Path) -> None:
     db_path = tmp_path / "hoard.db"
     conn = connect(db_path)
@@ -466,6 +524,58 @@ def test_conflict_detection_skips_retracted_source(tmp_path: Path) -> None:
 
     conflict_rows = conn.execute("SELECT * FROM memory_conflicts").fetchall()
     assert len(conflict_rows) == 0
+
+    conn.close()
+    writer.stop()
+
+
+def test_conflict_detection_skips_superseded_source(tmp_path: Path) -> None:
+    db_path = tmp_path / "hoard.db"
+    conn = connect(db_path)
+    initialize_db(conn)
+
+    writer = WriteCoordinator(db_path=db_path)
+    worker = Worker(db_path=db_path, config=_detection_config(), writer=writer)
+
+    mid1 = str(uuid.uuid4())
+    mid2 = str(uuid.uuid4())
+
+    _insert_memory(conn, mid1, "value A", slot="fact:test.key", scope_type="user")
+    _insert_memory(conn, mid2, "value B", slot="fact:test.key", scope_type="user")
+
+    now = datetime.utcnow().isoformat(timespec="seconds")
+    conn.execute("UPDATE memories SET superseded_by = ?, superseded_at = ? WHERE id = ?", (mid1, now, mid2))
+    conn.commit()
+
+    worker._process_conflicts(mid2)
+
+    assert conn.execute("SELECT count(*) FROM memory_conflicts").fetchone()[0] == 0
+
+    conn.close()
+    writer.stop()
+
+
+def test_conflict_detection_skips_expired_source(tmp_path: Path) -> None:
+    db_path = tmp_path / "hoard.db"
+    conn = connect(db_path)
+    initialize_db(conn)
+
+    writer = WriteCoordinator(db_path=db_path)
+    worker = Worker(db_path=db_path, config=_detection_config(), writer=writer)
+
+    mid1 = str(uuid.uuid4())
+    mid2 = str(uuid.uuid4())
+
+    _insert_memory(conn, mid1, "value A", slot="fact:test.key", scope_type="user")
+    _insert_memory(conn, mid2, "value B", slot="fact:test.key", scope_type="user")
+
+    past = (datetime.utcnow() - timedelta(hours=1)).isoformat(timespec="seconds")
+    conn.execute("UPDATE memories SET expires_at = ? WHERE id = ?", (past, mid2))
+    conn.commit()
+
+    worker._process_conflicts(mid2)
+
+    assert conn.execute("SELECT count(*) FROM memory_conflicts").fetchone()[0] == 0
 
     conn.close()
     writer.stop()
