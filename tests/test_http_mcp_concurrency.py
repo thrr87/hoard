@@ -72,7 +72,8 @@ def test_http_mcp_concurrent_search(tmp_path: Path, mcp_server) -> None:
                     "tools/call",
                     {"name": "search", "arguments": {"query": "Hoard", "limit": 1}},
                 )
-                assert resp["result"]["results"]
+                content = json.loads(resp["result"]["content"][0]["text"])
+                assert content["results"]
         except Exception as exc:  # pragma: no cover - diagnostic
             with lock:
                 errors.append(str(exc))

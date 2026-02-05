@@ -130,6 +130,9 @@ DEFAULT_CONFIG = {
             "top_k": 5,
             "contradiction_threshold": 0.7,
         },
+        "duplicates": {
+            "similarity_threshold": 0.85,
+        },
         "sensitivity": {
             "sensitive_max_ttl_days": 90,
             "restricted_max_ttl_days": 30,

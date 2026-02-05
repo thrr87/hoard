@@ -75,7 +75,13 @@ def _call_mcp(config: dict, method: str, params: dict, *, token_override: str | 
     if isinstance(payload, dict) and payload.get("error"):
         message = payload["error"].get("message", payload["error"])
         raise click.ClickException(str(message))
-    return payload.get("result", payload)
+    result = payload.get("result", payload)
+    if method == "tools/call" and isinstance(result, dict) and "content" in result:
+        try:
+            return json.loads(result["content"][0]["text"])
+        except (KeyError, IndexError, json.JSONDecodeError):
+            pass
+    return result
 
 
 def _call_admin(config: dict, method: str, params: dict) -> dict:
@@ -1946,7 +1952,14 @@ def _call_mcp(method: str, params: dict) -> dict:
 
 
 def _call_tool(name: str, arguments: dict) -> dict:
-    return _call_mcp("tools/call", {"name": name, "arguments": arguments})
+    resp = _call_mcp("tools/call", {"name": name, "arguments": arguments})
+    result = resp.get("result", resp)
+    if isinstance(result, dict) and "content" in result:
+        try:
+            return json.loads(result["content"][0]["text"])
+        except (KeyError, IndexError, json.JSONDecodeError):
+            pass
+    return result
 
 
 def search(query: str, limit: int = 10) -> dict:

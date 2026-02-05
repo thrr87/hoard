@@ -54,7 +54,8 @@ def test_orchestrator_mcp_task_flow(tmp_path: Path, mcp_server, monkeypatch) -> 
             },
         },
     )
-    agent_token = register_resp["result"]["token"]
+    register_content = json.loads(register_resp["result"]["content"][0]["text"])
+    agent_token = register_content["token"]
 
     _, task_resp = _call_mcp(
         url,
@@ -62,17 +63,21 @@ def test_orchestrator_mcp_task_flow(tmp_path: Path, mcp_server, monkeypatch) -> 
         "tools/call",
         {"name": "task.create", "arguments": {"name": "Demo task", "requires_capability": "cap.basic"}},
     )
-    task_id = task_resp["result"]["id"]
+    task_content = json.loads(task_resp["result"]["content"][0]["text"])
+    task_id = task_content["id"]
 
     _, poll_resp = _call_mcp(url, agent_token, "tools/call", {"name": "task.poll", "arguments": {"limit": 5}})
-    tasks = poll_resp["result"]["tasks"]
+    poll_content = json.loads(poll_resp["result"]["content"][0]["text"])
+    tasks = poll_content["tasks"]
     assert tasks and tasks[0]["id"] == task_id
 
     _, claim_resp = _call_mcp(url, agent_token, "tools/call", {"name": "task.claim", "arguments": {"task_id": task_id}})
-    assert claim_resp["result"]["task"]["status"] == "claimed"
+    claim_content = json.loads(claim_resp["result"]["content"][0]["text"])
+    assert claim_content["task"]["status"] == "claimed"
 
     _, start_resp = _call_mcp(url, agent_token, "tools/call", {"name": "task.start", "arguments": {"task_id": task_id}})
-    assert start_resp["result"]["success"] is True
+    start_content = json.loads(start_resp["result"]["content"][0]["text"])
+    assert start_content["success"] is True
 
     _, complete_resp = _call_mcp(
         url,
@@ -80,7 +85,8 @@ def test_orchestrator_mcp_task_flow(tmp_path: Path, mcp_server, monkeypatch) -> 
         "tools/call",
         {"name": "task.complete", "arguments": {"task_id": task_id, "output_summary": "done"}},
     )
-    assert complete_resp["result"]["success"] is True
+    complete_content = json.loads(complete_resp["result"]["content"][0]["text"])
+    assert complete_content["success"] is True
 
     _, artifact_resp = _call_mcp(
         url,
@@ -96,7 +102,8 @@ def test_orchestrator_mcp_task_flow(tmp_path: Path, mcp_server, monkeypatch) -> 
             },
         },
     )
-    artifact_id = artifact_resp["result"]["artifact"]["artifact_id"]
+    artifact_content = json.loads(artifact_resp["result"]["content"][0]["text"])
+    artifact_id = artifact_content["artifact"]["artifact_id"]
 
     _, artifact_get_resp = _call_mcp(
         url,
@@ -104,10 +111,12 @@ def test_orchestrator_mcp_task_flow(tmp_path: Path, mcp_server, monkeypatch) -> 
         "tools/call",
         {"name": "artifact.get", "arguments": {"artifact_id": artifact_id, "include_content": True}},
     )
-    assert artifact_get_resp["result"]["artifact"]["content"] == "hello"
+    artifact_get_content = json.loads(artifact_get_resp["result"]["content"][0]["text"])
+    assert artifact_get_content["artifact"]["content"] == "hello"
 
     _, event_resp = _call_mcp(url, agent_token, "tools/call", {"name": "event.poll", "arguments": {"limit": 50}})
-    event_types = [event["event_type"] for event in event_resp["result"]["events"]]
+    event_content = json.loads(event_resp["result"]["content"][0]["text"])
+    event_types = [event["event_type"] for event in event_content["events"]]
     assert "task.completed" in event_types
 
 

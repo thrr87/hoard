@@ -145,7 +145,8 @@ class StdioMCPServer:
             response = dispatch_tool(tool_name, arguments, conn, self.config, token)
             response_bytes = json.dumps(response).encode("utf-8")
             limiter.check_quota(token.name, count_chunks(response), len(response_bytes))
-            return self._build_result(msg_id, response)
+            content_result = {"content": [{"type": "text", "text": json.dumps(response)}]}
+            return self._build_result(msg_id, content_result)
         except AuthError as exc:
             return self._build_error(msg_id, -32001, str(exc))
         except ScopeError as exc:

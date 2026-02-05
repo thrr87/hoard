@@ -58,4 +58,5 @@ def test_cli_write_http_read(tmp_path: Path, mcp_server) -> None:
         {"name": "memory_get", "arguments": {"key": "shared_key"}},
     )
     assert status == 200
-    assert resp["result"]["memory"]["content"] == "from cli"
+    content = json.loads(resp["result"]["content"][0]["text"])
+    assert content["memory"]["content"] == "from cli"

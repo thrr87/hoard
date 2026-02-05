@@ -6,6 +6,14 @@ from hoard.core.embeddings.model import EmbeddingError, EmbeddingModel
 from hoard.core.search.bm25 import search_chunks_flat
 from hoard.core.search.vector import vector_search
 
+_model_cache: dict[str, EmbeddingModel] = {}
+
+
+def _get_model(model_name: str) -> EmbeddingModel:
+    if model_name not in _model_cache:
+        _model_cache[model_name] = EmbeddingModel(model_name)
+    return _model_cache[model_name]
+
 
 def hybrid_search(
     conn,
@@ -51,7 +59,7 @@ def hybrid_search(
 
     if vectors_enabled:
         try:
-            model = EmbeddingModel(model_name)
+            model = _get_model(model_name)
             query_vector = model.encode([query])[0]
             vector_results = vector_search(
                 conn,

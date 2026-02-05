@@ -11,6 +11,8 @@ from typing import Optional
 from hoard.core.db.connection import connect
 from hoard.core.db.writer import WriteCoordinator
 from hoard.core.memory.embeddings import encode_embedding
+from hoard.core.memory.model_cache import get_sentence_transformer
+from hoard.core.memory.predicates import active_memory_conditions
 
 
 class Worker:
@@ -193,9 +195,7 @@ class Worker:
         model_version = model_cfg.get("version", "2.0.0")
         dimensions = int(model_cfg.get("dimensions", 384))
 
-        from sentence_transformers import SentenceTransformer
-
-        model = SentenceTransformer(model_name)
+        model = get_sentence_transformer(model_name)
         vector = model.encode([content], normalize_embeddings=True)[0]
         blob = encode_embedding(vector, dimensions)
         embedded_at = datetime.utcnow().isoformat(timespec="seconds")
@@ -232,9 +232,208 @@ class Worker:
         self._writer.submit(_store)
 
     def _process_duplicates(self, memory_id: str) -> None:
-        # Placeholder: detection not implemented yet
-        return
+        embeddings_enabled = bool(
+            self._config.get("write", {}).get("embeddings", {}).get("enabled", False)
+        )
+        if not embeddings_enabled:
+            return
+
+        threshold = float(
+            self._config.get("write", {}).get("duplicates", {}).get("similarity_threshold", 0.85)
+        )
+        model_cfg = self._config.get("write", {}).get("embeddings", {}).get("active_model", {})
+        model_name = model_cfg.get("name", "sentence-transformers/all-MiniLM-L6-v2")
+        dimensions = int(model_cfg.get("dimensions", 384))
+
+        conn = connect(self._db_path)
+        try:
+            emb_row = conn.execute(
+                "SELECT embedding, model_name, dimensions FROM memory_embeddings WHERE memory_id = ?",
+                (memory_id,),
+            ).fetchone()
+            if not emb_row:
+                return
+            if emb_row["model_name"] != model_name or emb_row["dimensions"] != dimensions:
+                return
+
+            from array import array as float_array
+
+            query_arr = float_array("f")
+            query_arr.frombytes(emb_row["embedding"])
+            if len(query_arr) != dimensions:
+                return
+            query_vec = list(query_arr)
+
+            now = datetime.utcnow().isoformat(timespec="seconds")
+            src_conditions, src_params = active_memory_conditions(now, table_alias="m")
+            src_conditions.append("m.id = ?")
+            src_params.append(memory_id)
+            src_where = " AND ".join(src_conditions)
+            mem_row = conn.execute(
+                f"SELECT m.scope_type, m.scope_id FROM memories m WHERE {src_where}",
+                src_params,
+            ).fetchone()
+            if not mem_row:
+                return
+            conditions, params = active_memory_conditions(now)
+            conditions.append("m.id != ?")
+            params.append(memory_id)
+            if mem_row["scope_id"] is None:
+                conditions.append("m.scope_type = ?")
+                params.append(mem_row["scope_type"])
+                conditions.append("m.scope_id IS NULL")
+            else:
+                conditions.append("m.scope_type = ?")
+                params.append(mem_row["scope_type"])
+                conditions.append("m.scope_id = ?")
+                params.append(mem_row["scope_id"])
+
+            where_clause = " AND ".join(conditions)
+            candidates = conn.execute(
+                f"""
+                SELECT e.memory_id, e.embedding, e.model_name, e.dimensions
+                FROM memory_embeddings e
+                JOIN memories m ON m.id = e.memory_id
+                WHERE {where_clause}
+                """,
+                params,
+            ).fetchall()
+
+            duplicates = []
+            for cand in candidates:
+                if cand["model_name"] != model_name or cand["dimensions"] != dimensions:
+                    continue
+                cand_arr = float_array("f")
+                cand_arr.frombytes(cand["embedding"])
+                if len(cand_arr) != dimensions:
+                    continue
+                similarity = sum(a * b for a, b in zip(query_vec, cand_arr))
+                if similarity >= threshold:
+                    duplicates.append((cand["memory_id"], similarity))
+        finally:
+            conn.close()
+
+        if not duplicates:
+            return
+
+        def _store_duplicates(conn):
+            for other_id, similarity in duplicates:
+                already = conn.execute(
+                    """
+                    SELECT d.id FROM memory_duplicates d
+                    JOIN duplicate_members dm1 ON dm1.duplicate_id = d.id
+                    JOIN duplicate_members dm2 ON dm2.duplicate_id = d.id
+                    WHERE dm1.memory_id = ? AND dm2.memory_id = ?
+                      AND d.resolved_at IS NULL
+                    """,
+                    (memory_id, other_id),
+                ).fetchone()
+                if already:
+                    continue
+                dup_id = str(uuid.uuid4())
+                now_ts = datetime.utcnow().isoformat(timespec="seconds")
+                conn.execute(
+                    "INSERT INTO memory_duplicates (id, detected_at, similarity) VALUES (?, ?, ?)",
+                    (dup_id, now_ts, similarity),
+                )
+                conn.execute(
+                    "INSERT INTO duplicate_members (duplicate_id, memory_id, is_canonical) VALUES (?, ?, 1)",
+                    (dup_id, other_id),
+                )
+                conn.execute(
+                    "INSERT INTO duplicate_members (duplicate_id, memory_id, is_canonical) VALUES (?, ?, 0)",
+                    (dup_id, memory_id),
+                )
+
+        self._writer.submit(_store_duplicates)
 
     def _process_conflicts(self, memory_id: str) -> None:
-        # Placeholder: detection not implemented yet
-        return
+        conn = connect(self._db_path)
+        try:
+            now = datetime.utcnow().isoformat(timespec="seconds")
+            src_conditions, src_params = active_memory_conditions(now, table_alias="m")
+            src_conditions.append("m.id = ?")
+            src_params.append(memory_id)
+            src_where = " AND ".join(src_conditions)
+            mem_row = conn.execute(
+                f"SELECT m.slot, m.scope_type, m.scope_id FROM memories m WHERE {src_where}",
+                src_params,
+            ).fetchone()
+            if not mem_row or not mem_row["slot"]:
+                return
+
+            slot = mem_row["slot"]
+            scope_type = mem_row["scope_type"]
+            scope_id = mem_row["scope_id"]
+
+            now = datetime.utcnow().isoformat(timespec="seconds")
+            conditions, params = active_memory_conditions(now)
+            conditions.append("m.id != ?")
+            params.append(memory_id)
+            conditions.append("m.slot = ?")
+            params.append(slot)
+            conditions.append("m.scope_type = ?")
+            params.append(scope_type)
+            if scope_id is None:
+                conditions.append("m.scope_id IS NULL")
+            else:
+                conditions.append("m.scope_id = ?")
+                params.append(scope_id)
+
+            where_clause = " AND ".join(conditions)
+            others = conn.execute(
+                f"SELECT m.id FROM memories m WHERE {where_clause}",
+                params,
+            ).fetchall()
+
+            if not others:
+                return
+
+            other_ids = [row["id"] for row in others]
+
+            existing_conflict_id = None
+            for other_id in other_ids:
+                row = conn.execute(
+                    """
+                    SELECT cm.conflict_id FROM conflict_members cm
+                    JOIN memory_conflicts c ON c.id = cm.conflict_id
+                    WHERE cm.memory_id = ? AND c.resolved_at IS NULL
+                      AND c.slot = ? AND c.scope_type = ?
+                    """,
+                    (other_id, slot, scope_type),
+                ).fetchone()
+                if row:
+                    existing_conflict_id = row["conflict_id"]
+                    break
+        finally:
+            conn.close()
+
+        def _store_conflict(conn):
+            now_ts = datetime.utcnow().isoformat(timespec="seconds")
+            if existing_conflict_id:
+                already = conn.execute(
+                    "SELECT 1 FROM conflict_members WHERE conflict_id = ? AND memory_id = ?",
+                    (existing_conflict_id, memory_id),
+                ).fetchone()
+                if not already:
+                    conn.execute(
+                        "INSERT INTO conflict_members (conflict_id, memory_id, nli_label, added_at) VALUES (?, ?, NULL, ?)",
+                        (existing_conflict_id, memory_id, now_ts),
+                    )
+            else:
+                conflict_id = str(uuid.uuid4())
+                conn.execute(
+                    "INSERT INTO memory_conflicts (id, slot, scope_type, scope_id, detected_at) VALUES (?, ?, ?, ?, ?)",
+                    (conflict_id, slot, scope_type, scope_id, now_ts),
+                )
+                for mid in other_ids:
+                    conn.execute(
+                        "INSERT INTO conflict_members (conflict_id, memory_id, nli_label, added_at) VALUES (?, ?, NULL, ?)",
+                        (conflict_id, mid, now_ts),
+                    )
+                conn.execute(
+                    "INSERT INTO conflict_members (conflict_id, memory_id, nli_label, added_at) VALUES (?, ?, NULL, ?)",
+                    (conflict_id, memory_id, now_ts),
+                )
+
+        self._writer.submit(_store_conflict)

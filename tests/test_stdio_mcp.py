@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 from hoard.connectors.local_files.connector import LocalFilesConnector
@@ -80,11 +81,12 @@ def test_stdio_tools_list_and_search(tmp_path: Path) -> None:
         }
     )
     assert search_resp
-    results = search_resp["result"]["results"]
+    search_content = json.loads(search_resp["result"]["content"][0]["text"])
+    results = search_content["results"]
     assert results
-    assert search_resp["result"]["next_cursor"] is not None
+    assert search_content["next_cursor"] is not None
 
-    cursor = search_resp["result"]["next_cursor"]
+    cursor = search_content["next_cursor"]
     next_resp = server._handle_single_message(
         {
             "jsonrpc": "2.0",
@@ -97,7 +99,8 @@ def test_stdio_tools_list_and_search(tmp_path: Path) -> None:
         }
     )
     assert next_resp
-    assert next_resp["result"]["results"]
+    next_content = json.loads(next_resp["result"]["content"][0]["text"])
+    assert next_content["results"]
 
     write_resp = server._handle_single_message(
         {
