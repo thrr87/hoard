@@ -94,6 +94,7 @@ def hybrid_search(
                 "entity_title": detail["entity_title"],
                 "source": detail["source"],
                 "uri": detail["uri"],
+                "entity_updated_at": detail["entity_updated_at"],
                 "chunks": [],
             }
 
@@ -153,7 +154,8 @@ def _fetch_chunk_details(conn, chunk_ids: Iterable[str]) -> Dict[str, Dict[str, 
         f"""
         SELECT chunks.id AS chunk_id, chunks.entity_id, chunks.content,
                chunks.char_offset_start, chunks.char_offset_end,
-               entities.title AS entity_title, entities.source, entities.uri
+               entities.title AS entity_title, entities.source, entities.uri,
+               entities.updated_at AS entity_updated_at
         FROM chunks
         JOIN entities ON entities.id = chunks.entity_id
         WHERE chunks.id IN ({placeholders})
@@ -171,6 +173,7 @@ def _fetch_chunk_details(conn, chunk_ids: Iterable[str]) -> Dict[str, Dict[str, 
             "entity_title": row["entity_title"],
             "source": row["source"],
             "uri": row["uri"],
+            "entity_updated_at": row["entity_updated_at"],
         }
         for row in rows
     }

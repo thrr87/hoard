@@ -21,3 +21,27 @@ def test_memory_put_get_search(tmp_path: Path) -> None:
     results = memory_search(conn, "Hoard")
     assert results
     conn.close()
+
+
+def test_memory_ttl_expiration(tmp_path: Path) -> None:
+    db_path = tmp_path / "hoard.db"
+    conn = connect(db_path)
+    initialize_db(conn)
+
+    entry = memory_put(conn, key="ttl", content="expires soon", ttl_days=1)
+    assert entry["expires_at"] is not None
+
+    expired_entry = memory_put(
+        conn,
+        key="expired",
+        content="expired content",
+        expires_at="2000-01-01T00:00:00",
+    )
+    assert expired_entry["expires_at"] == "2000-01-01T00:00:00"
+
+    assert memory_get(conn, "ttl") is not None
+    assert memory_get(conn, "expired") is None
+
+    results = memory_search(conn, "expired")
+    assert not results
+    conn.close()

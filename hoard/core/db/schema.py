@@ -138,7 +138,8 @@ SCHEMA_STATEMENTS = [
         tags_text TEXT,
         metadata JSON,
         created_at DATETIME,
-        updated_at DATETIME
+        updated_at DATETIME,
+        expires_at DATETIME
     );
     """,
     """

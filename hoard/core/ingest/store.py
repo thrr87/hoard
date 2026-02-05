@@ -122,17 +122,28 @@ def replace_chunks(conn, entity_id: str, chunks: List[ChunkInput]) -> int:
 def tombstone_missing(conn, source: str, seen_source_ids: Iterable[str]) -> int:
     now = _now_iso()
     seen_list = list(seen_source_ids)
-    placeholders = ",".join("?" for _ in seen_list)
-
-    if placeholders:
-        query = (
-            f"UPDATE entities SET tombstoned_at = ?, last_seen_at = NULL "
-            f"WHERE source = ? AND source_id NOT IN ({placeholders})"
+    if not seen_list:
+        cursor = conn.execute(
+            "UPDATE entities SET tombstoned_at = ?, last_seen_at = NULL WHERE source = ?",
+            (now, source),
         )
-        params = [now, source, *seen_list]
-    else:
-        query = "UPDATE entities SET tombstoned_at = ?, last_seen_at = NULL WHERE source = ?"
-        params = [now, source]
+        return cursor.rowcount
 
-    cursor = conn.execute(query, params)
+    conn.execute("CREATE TEMP TABLE IF NOT EXISTS _hoard_seen_source_ids (source_id TEXT PRIMARY KEY)")
+    conn.execute("DELETE FROM _hoard_seen_source_ids")
+    conn.executemany(
+        "INSERT OR IGNORE INTO _hoard_seen_source_ids (source_id) VALUES (?)",
+        [(source_id,) for source_id in seen_list],
+    )
+
+    cursor = conn.execute(
+        """
+        UPDATE entities
+        SET tombstoned_at = ?, last_seen_at = NULL
+        WHERE source = ?
+          AND source_id NOT IN (SELECT source_id FROM _hoard_seen_source_ids)
+        """,
+        (now, source),
+    )
+    conn.execute("DROP TABLE IF EXISTS _hoard_seen_source_ids")
     return cursor.rowcount

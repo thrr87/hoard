@@ -36,7 +36,8 @@
 **Allowed / Supported**
 - Read-only indexing of local files, Obsidian vaults, and browser bookmarks.
 - Notion export ingestion (ZIP/HTML/CSV).
-- Local search, get, get_chunk, and memory tools (read/write).
+- Agent inbox (drop folder) + MCP ingestion.
+- Local search, get, get_chunk, sync, and memory tools (read/write).
 - Trusted connectors (v1): install only what you trust.
 
 **Not in v1**
@@ -91,6 +92,7 @@ hoard init                 # full wizard
 hoard init --quick         # accept defaults
 hoard init --vectors       # enable semantic search
 hoard add <path>           # add folder quickly
+hoard add --inbox <path>   # agent inbox (drop folder)
 hoard add --obsidian <path>
 hoard add --notion <path>
 ```
@@ -99,6 +101,14 @@ hoard add --notion <path>
 ```bash
 hoard sync
 hoard search "query" --limit 5
+hoard search "query" --types entity,memory
+hoard search "query" --no-memory
+```
+
+### Memory
+```bash
+hoard memory put key "content" --ttl-days 30
+hoard memory prune
 ```
 
 ### Embeddings
@@ -114,6 +124,11 @@ hoard serve --daemon
 hoard serve --status
 hoard serve --stop
 hoard serve --install-autostart
+```
+
+### Optional Dependencies
+```bash
+pip install -e ".[watcher]"  # enable file watcher
 ```
 
 ### Write Layer (v0.7)
@@ -149,6 +164,18 @@ hoard setup --uninstall openclaw
 ```bash
 hoard doctor
 ```
+
+---
+
+## Benchmarks
+
+```bash
+pip install -e ".[dev]"
+python -m pytest -q tests/test_search_benchmark.py
+python -m pytest -q tests/test_search_benchmark.py --benchmark-save baseline
+```
+
+Saved baselines live under `.benchmarks/` and are machine-specific.
 
 ---
 
@@ -199,6 +226,19 @@ connectors:
   notion_export:
     enabled: true
     export_path: ~/Downloads/notion-export.zip
+
+  inbox:
+    enabled: true
+    path: ~/.hoard/inbox
+
+memory:
+  default_ttl_days: 30
+  prune_on_sync: true
+
+sync:
+  interval_minutes: 15
+  watcher_enabled: false
+  watcher_debounce_seconds: 2
 ```
 
 ---

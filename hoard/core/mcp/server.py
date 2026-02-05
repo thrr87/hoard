@@ -131,18 +131,35 @@ class MCPRequestHandler(BaseHTTPRequestHandler):
         if method == "tools/call":
             tool_name = params.get("name")
             arguments = params.get("arguments") or {}
-            limiter.check_request(token.name, tool_name)
-            response = self._dispatch_tool(tool_name, arguments, conn, token)
-            response_bytes = json.dumps(response).encode("utf-8")
-            limiter.check_quota(token.name, count_chunks(response), len(response_bytes))
-            self._log_access(
-                tool=tool_name,
-                success=True,
-                token_name=token.name,
-                chunks_returned=count_chunks(response),
-                bytes_returned=len(response_bytes),
-            )
-            return {"jsonrpc": "2.0", "id": msg_id, "result": response}
+            if not tool_name:
+                return _jsonrpc_error(payload, -32602, "Missing tool name")
+            try:
+                limiter.check_request(token.name, tool_name)
+                response = self._dispatch_tool(tool_name, arguments, conn, token)
+                response_bytes = json.dumps(response).encode("utf-8")
+                limiter.check_quota(token.name, count_chunks(response), len(response_bytes))
+                self._log_access(
+                    tool=tool_name,
+                    success=True,
+                    token_name=token.name,
+                    chunks_returned=count_chunks(response),
+                    bytes_returned=len(response_bytes),
+                )
+                return {"jsonrpc": "2.0", "id": msg_id, "result": response}
+            except ValueError as exc:
+                self._log_access(
+                    tool=tool_name,
+                    success=False,
+                    token_name=token.name,
+                )
+                return _jsonrpc_error(payload, -32601, str(exc))
+            except Exception as exc:  # pragma: no cover - safety net
+                self._log_access(
+                    tool=tool_name,
+                    success=False,
+                    token_name=token.name,
+                )
+                return _jsonrpc_error(payload, -32603, str(exc))
 
         return _jsonrpc_error(payload, -32601, "Method not found")
 
@@ -160,8 +177,8 @@ class MCPRequestHandler(BaseHTTPRequestHandler):
             return TokenInfo(
                 name="admin",
                 token=None,
-                scopes={"admin", "sync", "memory", "search", "get"},
-                capabilities={"admin", "sync", "memory", "search", "get"},
+                scopes={"admin", "sync", "memory", "search", "get", "ingest"},
+                capabilities={"admin", "sync", "memory", "search", "get", "ingest"},
                 trust_level=1.0,
                 can_access_sensitive=True,
                 can_access_restricted=True,

@@ -6,6 +6,7 @@ import importlib
 
 from hoard.connectors.bookmarks_chrome.connector import ChromeBookmarksConnector
 from hoard.connectors.bookmarks_firefox.connector import FirefoxBookmarksConnector
+from hoard.connectors.inbox.connector import InboxConnector
 from hoard.connectors.local_files.connector import LocalFilesConnector
 from hoard.connectors.notion_export.connector import NotionExportConnector
 from hoard.connectors.obsidian.connector import ObsidianConnector
@@ -14,6 +15,7 @@ from hoard.sdk.base import ConnectorV1
 
 BUILTIN_CONNECTORS: Dict[str, type[ConnectorV1]] = {
     "local_files": LocalFilesConnector,
+    "inbox": InboxConnector,
     "obsidian": ObsidianConnector,
     "bookmarks_chrome": ChromeBookmarksConnector,
     "bookmarks_firefox": FirefoxBookmarksConnector,

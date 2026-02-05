@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 from typing import Any, Dict, List
+import secrets
 
 from hoard.core.embeddings.model import EmbeddingError, EmbeddingModel
 from hoard.core.embeddings.store import build_embeddings
-from hoard.core.memory.store import memory_get, memory_put, memory_search
+from hoard.core.ingest.inbox import write_inbox_entry
+from hoard.core.ingest.sync import run_sync
+from hoard.core.memory.store import memory_get, memory_get_by_id, memory_put, memory_search
 from hoard.core.memory.v2.store import (
     conflict_resolve,
     conflicts_list,
@@ -18,13 +21,11 @@ from hoard.core.memory.v2.store import (
     memory_supersede,
     memory_write,
 )
-from hoard.core.ingest.sync import run_sync
 from hoard.core.search.getters import get_chunk, get_entity
 from hoard.core.search.service import search_entities
-import secrets
-
 from hoard.core.security.agent_tokens import delete_agent, list_agents, register_agent
 from hoard.core.security.auth import require_scopes
+from hoard.core.sync.service import sync_with_lock
 
 WRITE_TOOLS = {
     "memory_put",
@@ -35,10 +36,12 @@ WRITE_TOOLS = {
     "memory_review",
     "conflict_resolve",
     "duplicate_resolve",
+    "sync",
     "sync_run",
     "embeddings_build",
     "agent_register",
     "agent_remove",
+    "inbox_put",
 }
 
 
@@ -56,6 +59,19 @@ def dispatch_tool(tool: str, arguments: Dict[str, Any], conn, config: Dict[str, 
         cursor = arguments.get("cursor")
         offset = int(cursor or 0)
         source = arguments.get("source")
+        include_memory = arguments.get("include_memory")
+        types = arguments.get("types")
+        if types is None:
+            if include_memory is None:
+                types = ["entity", "memory"]
+            else:
+                types = ["entity", "memory"] if bool(include_memory) else ["entity"]
+        elif isinstance(types, str):
+            types = [value.strip() for value in types.split(",") if value.strip()]
+
+        if "memory" not in token.scopes and isinstance(types, list):
+            types = [value for value in types if value != "memory"]
+
         results, next_cursor = search_entities(
             conn,
             query=query,
@@ -64,13 +80,45 @@ def dispatch_tool(tool: str, arguments: Dict[str, Any], conn, config: Dict[str, 
             offset=offset,
             source=source,
             allow_sensitive=allow_sensitive,
+            types=types if isinstance(types, list) else None,
         )
         return {"results": results, "next_cursor": next_cursor}
 
     if tool == "get":
         require_scopes(token, ["get"])
         entity_id = arguments.get("entity_id")
-        return {"entity": get_entity(conn, entity_id, allow_sensitive=allow_sensitive)}
+        entity = get_entity(conn, entity_id, allow_sensitive=allow_sensitive)
+        if entity is not None:
+            return {"entity": entity}
+
+        if "memory" in token.scopes:
+            memory_entry = memory_get_by_id(conn, entity_id)
+            if memory_entry:
+                return {
+                    "entity": {
+                        "result_type": "memory",
+                        "entity_id": memory_entry["id"],
+                        "entity_title": memory_entry["key"],
+                        "source": "memory",
+                        "uri": None,
+                        "memory_key": memory_entry["key"],
+                        "updated_at": memory_entry["updated_at"],
+                        "tags": memory_entry.get("tags", []),
+                        "metadata": memory_entry.get("metadata"),
+                        "chunks": [
+                            {
+                                "chunk_id": memory_entry["id"],
+                                "chunk_index": 0,
+                                "content": memory_entry["content"],
+                                "char_offset_start": None,
+                                "char_offset_end": None,
+                                "chunk_type": "memory",
+                            }
+                        ],
+                    }
+                }
+
+        return {"entity": None}
 
     if tool == "get_chunk":
         require_scopes(token, ["get"])
@@ -95,12 +143,18 @@ def dispatch_tool(tool: str, arguments: Dict[str, Any], conn, config: Dict[str, 
 
     if tool == "memory_put":
         require_scopes(token, ["memory"])
+        ttl_days = arguments.get("ttl_days")
+        expires_at = arguments.get("expires_at")
+        default_ttl_days = config.get("memory", {}).get("default_ttl_days")
         entry = memory_put(
             conn,
             key=arguments.get("key"),
             content=arguments.get("content"),
             tags=arguments.get("tags"),
             metadata=arguments.get("metadata"),
+            ttl_days=ttl_days,
+            expires_at=expires_at,
+            default_ttl_days=default_ttl_days,
         )
         return {"memory": entry}
 
@@ -207,6 +261,32 @@ def dispatch_tool(tool: str, arguments: Dict[str, Any], conn, config: Dict[str, 
         )
         return {"success": success}
 
+    if tool == "sync":
+        require_scopes(token, ["sync"])
+        source = arguments.get("source")
+        return sync_with_lock(conn, config, source=source)
+
+    if tool == "inbox_put":
+        require_scopes(token, ["ingest"])
+        content = arguments.get("content")
+        if content is None:
+            raise ValueError("Missing content")
+        path = write_inbox_entry(
+            config,
+            content=content,
+            title=arguments.get("title"),
+            tags=arguments.get("tags"),
+            metadata=arguments.get("metadata"),
+            filename=arguments.get("filename"),
+            extension=arguments.get("extension", ".md"),
+        )
+
+        sync_immediately = bool(arguments.get("sync_immediately", False))
+        if sync_immediately or not config.get("sync", {}).get("watcher_enabled", False):
+            sync_with_lock(conn, config, source="inbox")
+
+        return {"path": str(path)}
+
     if tool == "sync_status":
         require_scopes(token, ["sync"])
         return _sync_status(conn)
@@ -309,6 +389,15 @@ def tool_definitions() -> List[Dict[str, Any]]:
                         "type": "string",
                         "description": "Optional source filter (e.g., local_files, obsidian).",
                     },
+                    "types": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Result types to include (entity, memory).",
+                    },
+                    "include_memory": {
+                        "type": "boolean",
+                        "description": "Deprecated. Use types instead. True includes memory results.",
+                    },
                     "token": {
                         "type": "string",
                         "description": "Auth token (if HOARD_TOKEN env not set).",
@@ -404,6 +493,14 @@ def tool_definitions() -> List[Dict[str, Any]]:
                     "metadata": {
                         "type": "object",
                         "description": "Optional metadata object.",
+                    },
+                    "ttl_days": {
+                        "type": "integer",
+                        "description": "Optional time-to-live in days.",
+                    },
+                    "expires_at": {
+                        "type": "string",
+                        "description": "Optional ISO timestamp when the memory expires.",
                     },
                     "token": {
                         "type": "string",
@@ -581,6 +678,67 @@ def tool_definitions() -> List[Dict[str, Any]]:
                     "token": {"type": "string"},
                 },
                 "required": ["duplicate_id", "resolution"],
+            },
+        },
+        {
+            "name": "sync",
+            "description": "Run a sync for enabled connectors.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "source": {
+                        "type": "string",
+                        "description": "Optional connector source name to sync.",
+                    },
+                    "token": {
+                        "type": "string",
+                        "description": "Auth token (if HOARD_TOKEN env not set).",
+                    },
+                },
+                "required": [],
+            },
+        },
+        {
+            "name": "inbox_put",
+            "description": "Store a document into the configured inbox folder.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "title": {
+                        "type": "string",
+                        "description": "Optional title used to generate the filename.",
+                    },
+                    "content": {
+                        "type": "string",
+                        "description": "Document content.",
+                    },
+                    "tags": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Optional tags stored in frontmatter.",
+                    },
+                    "metadata": {
+                        "type": "object",
+                        "description": "Optional metadata stored in frontmatter.",
+                    },
+                    "filename": {
+                        "type": "string",
+                        "description": "Optional custom filename.",
+                    },
+                    "extension": {
+                        "type": "string",
+                        "description": "File extension (default .md).",
+                    },
+                    "sync_immediately": {
+                        "type": "boolean",
+                        "description": "If true, run a sync after writing.",
+                    },
+                    "token": {
+                        "type": "string",
+                        "description": "Auth token (if HOARD_TOKEN env not set).",
+                    },
+                },
+                "required": ["content"],
             },
         },
         {
