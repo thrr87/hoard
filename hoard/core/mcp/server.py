@@ -186,7 +186,8 @@ class MCPRequestHandler(BaseHTTPRequestHandler):
                     chunks_returned=count_chunks(response),
                     bytes_returned=len(response_bytes),
                 )
-                return {"jsonrpc": "2.0", "id": msg_id, "result": response}
+                content_result = _wrap_tool_result(response)
+                return {"jsonrpc": "2.0", "id": msg_id, "result": content_result}
             except ValueError as exc:
                 self._log_access(
                     tool=tool_name,
@@ -323,6 +324,10 @@ def run_server(
 
     server.worker.start()
     server.serve_forever()
+
+
+def _wrap_tool_result(response: Dict[str, Any]) -> Dict[str, Any]:
+    return {"content": [{"type": "text", "text": json.dumps(response)}]}
 
 
 def _jsonrpc_error(payload: Dict[str, Any], code: int, message: str) -> Dict[str, Any]:

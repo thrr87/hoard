@@ -71,7 +71,8 @@ def test_http_mcp_tools_list_and_search(tmp_path: Path, mcp_server) -> None:
             "tools/call",
             {"name": "search", "arguments": {"query": "Hoard", "limit": 1}},
         )
-        assert search["result"]["results"]
+        content = json.loads(search["result"]["content"][0]["text"])
+        assert content["results"]
     finally:
         pass
 
@@ -143,7 +144,8 @@ def test_http_mcp_inbox_put_and_sync(tmp_path: Path, mcp_server) -> None:
                 "tools/call",
                 {"name": "inbox_put", "arguments": {"content": "Inbox HTTP content"}},
             )
-            assert "path" in inbox_resp["result"]
+            inbox_content = json.loads(inbox_resp["result"]["content"][0]["text"])
+            assert "path" in inbox_content
 
             _, search = _call_mcp(
                 url,
@@ -151,7 +153,8 @@ def test_http_mcp_inbox_put_and_sync(tmp_path: Path, mcp_server) -> None:
                 "tools/call",
                 {"name": "search", "arguments": {"query": "Inbox HTTP", "limit": 1}},
             )
-            assert search["result"]["results"]
+            search_content = json.loads(search["result"]["content"][0]["text"])
+            assert search_content["results"]
         finally:
             pass
     finally:

@@ -3,6 +3,14 @@ from __future__ import annotations
 from typing import Any, Dict, List
 
 
+def _sanitize_fts_query(query: str) -> str:
+    """Escape FTS5 metacharacters by wrapping each token in double quotes."""
+    tokens = query.split()
+    if not tokens:
+        return query
+    return " ".join('"' + token.replace('"', '""') + '"' for token in tokens)
+
+
 def search_chunks_flat(
     conn,
     query: str,
@@ -27,7 +35,7 @@ def search_chunks_flat(
         " AND entities.tombstoned_at IS NULL"
     )
 
-    params: list[Any] = [query]
+    params: list[Any] = [_sanitize_fts_query(query)]
     if source:
         sql += " AND entities.source = ?"
         params.append(source)

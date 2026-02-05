@@ -7,7 +7,18 @@ from datetime import datetime, timedelta
 from typing import Any, Dict, Iterable, List, Optional
 
 from hoard.core.memory.predicates import active_memory_conditions
+from hoard.core.search.bm25 import _sanitize_fts_query
 from hoard.core.security.auth import TokenInfo
+
+
+_st_cache: dict[str, Any] = {}
+
+
+def _get_sentence_transformer(model_name: str):
+    if model_name not in _st_cache:
+        from sentence_transformers import SentenceTransformer
+        _st_cache[model_name] = SentenceTransformer(model_name)
+    return _st_cache[model_name]
 
 
 class MemoryError(Exception):
@@ -547,7 +558,7 @@ def memory_query(
             ORDER BY bm25(memories_fts)
             LIMIT ?
             """,
-            [query, *base_params, *tag_params, union_limit * 5],
+            [_sanitize_fts_query(query), *base_params, *tag_params, union_limit * 5],
         ).fetchall()
 
         fts_scores: dict[str, float] = {}
@@ -564,12 +575,11 @@ def memory_query(
         )
         if vectors_enabled:
             try:
-                from sentence_transformers import SentenceTransformer
                 import numpy as np
 
                 model_cfg = config.get("write", {}).get("embeddings", {}).get("active_model", {})
                 model_name = model_cfg.get("name", "sentence-transformers/all-MiniLM-L6-v2")
-                model = SentenceTransformer(model_name)
+                model = _get_sentence_transformer(model_name)
                 query_vec = model.encode([query], normalize_embeddings=True)[0]
 
                 emb_rows = conn.execute(
