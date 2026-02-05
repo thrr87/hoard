@@ -77,8 +77,8 @@ def register_agent(
     lookup_hash = compute_lookup_hash(token, config)
     secure_hash = compute_secure_hash(token)
 
-    can_access_sensitive = 1 if "sensitive" in scope_list else 0
-    can_access_restricted = 1 if "restricted" in scope_list else 0
+    can_access_sensitive = 1 if ("sensitive" in scope_list or "data.sensitive" in scope_list) else 0
+    can_access_restricted = 1 if ("restricted" in scope_list or "data.restricted" in scope_list) else 0
 
     existing = conn.execute(
         "SELECT agent_id FROM agent_tokens WHERE agent_id = ?",

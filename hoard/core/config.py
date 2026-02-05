@@ -142,6 +142,34 @@ DEFAULT_CONFIG = {
             "union_multiplier": 2,
         },
     },
+    "artifacts": {
+        "blob_path": "~/.hoard/artifacts",
+        "inline_max_bytes": 262_144,
+        "retention_days": 30,
+    },
+    "orchestrator": {
+        "registration_token_env": "HOARD_REGISTRATION_TOKEN",
+        "fallback_max_bytes": 10_485_760,
+        "default_scopes": [
+            "agent.self",
+            "data.search",
+            "data.get",
+            "memory.read",
+            "task.claim",
+            "task.execute",
+            "artifact.read",
+            "artifact.write",
+            "event.read",
+            "cost.write",
+        ],
+    },
+    "cost": {
+        "budgets": {
+            "per_agent": {"default": 5.0},
+            "per_workflow": {"default": 50.0},
+            "global": {"daily": 50.0, "monthly": 500.0},
+        }
+    },
     "storage": {
         "db_path": "~/.hoard/hoard.db",
     },
@@ -182,6 +210,10 @@ def _expand_config_paths(config: Dict[str, Any]) -> Dict[str, Any]:
     storage = config.get("storage", {})
     if "db_path" in storage:
         storage["db_path"] = _expand_path(storage["db_path"])
+
+    artifacts = config.get("artifacts", {})
+    if "blob_path" in artifacts:
+        artifacts["blob_path"] = _expand_path(artifacts["blob_path"])
 
     connectors = config.get("connectors", {})
     for connector in connectors.values():

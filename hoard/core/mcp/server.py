@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import os
+import time
+import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Dict
@@ -13,6 +15,7 @@ from hoard.core.config import load_config, resolve_paths
 from hoard.core.db.connection import connect, ensure_sqlite_version
 from hoard.core.db.writer import WriteCoordinator
 from hoard.core.mcp.tools import count_chunks, dispatch_tool, is_write_tool, tool_definitions
+from hoard.core.orchestrator.events import poll_events
 from hoard.core.security.agent_tokens import ensure_agent_from_config
 from hoard.migrations import get_current_version, get_migrations, migrate
 from hoard.core.security.audit import log_access
@@ -39,6 +42,9 @@ class MCPRequestHandler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:  # noqa: N802
         if self.path == "/sync_status":
             self._handle_custom_http()
+            return
+        if self.path.startswith("/events"):
+            self._handle_events()
             return
         self._write_json(404, {"error": "Not found"})
 
@@ -97,6 +103,41 @@ class MCPRequestHandler(BaseHTTPRequestHandler):
             self._write_json(403, _jsonrpc_error(payload, -32002, str(exc)))
         except RateLimitError as exc:
             self._write_json(429, _jsonrpc_error(payload, -32003, str(exc)))
+        finally:
+            conn.close()
+
+    def _handle_events(self) -> None:
+        parsed = urllib.parse.urlparse(self.path)
+        params = urllib.parse.parse_qs(parsed.query)
+        since = params.get("since", [None])[0]
+        limit = int(params.get("limit", [50])[0] or 50)
+
+        conn = connect(self.server.db_path)
+        try:
+            token = self._authenticate(conn)
+            _require_event_read(token)
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("Connection", "keep-alive")
+            self.end_headers()
+
+            last_seen = self.headers.get("Last-Event-ID") or since
+            while True:
+                events = poll_events(conn, since=last_seen, limit=limit)
+                for event in events:
+                    payload = json.dumps(event)
+                    self.wfile.write(f"id: {event['published_at']}\n".encode("utf-8"))
+                    self.wfile.write(f"event: {event['event_type']}\n".encode("utf-8"))
+                    self.wfile.write(f"data: {payload}\n\n".encode("utf-8"))
+                    last_seen = event["published_at"]
+                self.wfile.write(b": keep-alive\n\n")
+                self.wfile.flush()
+                time.sleep(1)
+        except (AuthError, ScopeError) as exc:
+            self._write_json(403, {"error": str(exc)})
+        except (BrokenPipeError, ConnectionResetError):
+            return
         finally:
             conn.close()
 
@@ -182,6 +223,20 @@ class MCPRequestHandler(BaseHTTPRequestHandler):
                 trust_level=1.0,
                 can_access_sensitive=True,
                 can_access_restricted=True,
+                requires_user_confirm=False,
+                proposal_ttl_days=None,
+                rate_limit_per_hour=0,
+            )
+        registration_token = _registration_token(self.server.config)
+        if registration_token and token_value == registration_token:
+            return TokenInfo(
+                name="registrar",
+                token=None,
+                scopes={"agent.register"},
+                capabilities={"agent.register"},
+                trust_level=0.5,
+                can_access_sensitive=False,
+                can_access_restricted=False,
                 requires_user_confirm=False,
                 proposal_ttl_days=None,
                 rate_limit_per_hour=0,
@@ -302,3 +357,20 @@ def _bootstrap_tokens(conn, config: dict) -> None:
         ensure_agent_from_config(conn, config, name, value, scopes)
     if tokens:
         conn.commit()
+
+
+def _registration_token(config: dict) -> str | None:
+    env_key = config.get("orchestrator", {}).get("registration_token_env", "HOARD_REGISTRATION_TOKEN")
+    if env_key:
+        value = os.environ.get(env_key)
+        if value:
+            return value
+    return config.get("orchestrator", {}).get("registration_token")
+
+
+def _require_event_read(token: TokenInfo) -> None:
+    if "admin" in token.scopes:
+        return
+    if "event.read" in token.scopes:
+        return
+    raise ScopeError("Missing scopes: event.read")

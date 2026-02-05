@@ -5,6 +5,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from hoard.core.memory.store import memory_search
 from hoard.core.search.bm25 import search_entities_bm25
+from hoard.core.security.auth import TokenInfo
 from hoard.core.search.hybrid import hybrid_search
 
 
@@ -18,6 +19,7 @@ def search_entities(
     source: str | None = None,
     allow_sensitive: bool = True,
     types: Optional[List[str]] = None,
+    agent: Optional[TokenInfo] = None,
 ) -> Tuple[List[Dict[str, Any]], Optional[str]]:
     if limit < 0:
         limit = 0
@@ -63,7 +65,7 @@ def search_entities(
 
     memory_results: List[Dict[str, Any]] = []
     if "memory" in normalized_types:
-        memory_rows = memory_search(conn, query, limit=requested)
+        memory_rows = memory_search(conn, query, limit=requested, agent=agent, config=config)
         for entry in memory_rows:
             memory_results.append(
                 {

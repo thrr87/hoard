@@ -98,3 +98,16 @@ def test_stdio_tools_list_and_search(tmp_path: Path) -> None:
     )
     assert next_resp
     assert next_resp["result"]["results"]
+
+    write_resp = server._handle_single_message(
+        {
+            "jsonrpc": "2.0",
+            "id": 5,
+            "method": "tools/call",
+            "params": {
+                "name": "memory_put",
+                "arguments": {"key": "k", "content": "v", "token": "hoard_sk_test"},
+            },
+        }
+    )
+    assert write_resp["error"]["code"] == -32004
