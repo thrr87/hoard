@@ -20,6 +20,8 @@
 
 **Documentation:** [openhoard.vercel.app](https://openhoard.vercel.app)
 
+**Versioning note:** The package version (currently 0.1.x, pre‑alpha) is independent from feature milestone labels in this README (e.g., “v0.7” write layer, “v1” security/connectors). Milestones describe maturity of specific subsystems, not a released package version.
+
 ---
 
 ## Why Hoard
@@ -60,6 +62,7 @@ hoard search "my notes"
 ### Recommended setup flow
 ```bash
 hoard init           # wizard: choose sources, file types, vectors
+export HOARD_SERVER_SECRET=$(python -c "import secrets; print(secrets.token_hex(32))")
 hoard serve          # start HTTP MCP server (default port 19850)
 hoard setup --all    # configure Claude Code / Codex / OpenClaw
 ```
@@ -130,12 +133,19 @@ hoard embeddings build
 
 ### Server
 ```bash
+export HOARD_SERVER_SECRET=$(python -c "import secrets; print(secrets.token_hex(32))")
 hoard serve                # HTTP MCP server (http://127.0.0.1:19850/mcp)
                          # SSE events: http://127.0.0.1:19850/events
 hoard serve --daemon
 hoard serve --status
 hoard serve --stop
 hoard serve --install-autostart
+```
+
+To run in read-only mode without a server secret, set in `~/.hoard/config.yaml`:
+```yaml
+write:
+  enabled: false
 ```
 
 ### Optional Dependencies
@@ -204,6 +214,16 @@ hoard serve
 ```bash
 hoard mcp stdio
 ```
+
+---
+
+## Additional MCP Tools
+
+Beyond `search/get/get_chunk/sync`, Hoard exposes tools for:
+- Structured memory writes and review (`memory_write`, `memory_propose`, `memory_review`, `memory_supersede`, `memory_retract`)
+- Memory conflict/duplicate resolution (`conflicts_list`, `conflict_resolve`, `duplicates_list`, `duplicate_resolve`)
+- Agent inbox ingestion (`inbox_put`)
+- Orchestration and artifacts (agents, tasks, workflows, events, cost reporting)
 
 ---
 
