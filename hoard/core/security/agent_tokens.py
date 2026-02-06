@@ -3,7 +3,6 @@ from __future__ import annotations
 import hmac
 import hashlib
 import json
-import os
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Iterable, List, Optional
@@ -11,6 +10,7 @@ from typing import Iterable, List, Optional
 from argon2 import PasswordHasher, Type
 
 from hoard.core.security.errors import AuthError
+from hoard.core.security.server_secret import require_server_secret
 
 
 @dataclass(frozen=True)
@@ -31,11 +31,7 @@ def _now_iso() -> str:
 
 
 def _server_secret(config: dict) -> bytes:
-    env_key = config.get("write", {}).get("server_secret_env", "HOARD_SERVER_SECRET")
-    secret = os.environ.get(env_key)
-    if not secret:
-        raise RuntimeError(f"{env_key} environment variable not set")
-    return secret.encode()
+    return require_server_secret(config).encode()
 
 
 def _hasher() -> PasswordHasher:

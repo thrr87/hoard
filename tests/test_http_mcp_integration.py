@@ -99,6 +99,51 @@ def test_http_mcp_auth_error(tmp_path: Path, mcp_server) -> None:
         pass
 
 
+def test_http_mcp_admin_auth_uses_file_secret(tmp_path: Path, mcp_server, monkeypatch) -> None:
+    monkeypatch.delenv("HOARD_SERVER_SECRET", raising=False)
+    db_path = tmp_path / "hoard.db"
+    secret_file = tmp_path / "server.key"
+    secret_file.write_text("file-secret\n")
+    config_path = tmp_path / "config.yaml"
+    config = {
+        "storage": {"db_path": str(db_path)},
+        "write": {"server_secret_file": str(secret_file)},
+    }
+    save_config(config, config_path)
+
+    url = mcp_server(config_path)
+    status, resp = _call_mcp(url, "file-secret", "tools/list", {})
+    assert status == 200
+    assert resp["result"]["tools"]
+
+
+def test_http_mcp_config_token_still_works_with_file_secret(tmp_path: Path, mcp_server, monkeypatch) -> None:
+    monkeypatch.delenv("HOARD_SERVER_SECRET", raising=False)
+    db_path = tmp_path / "hoard.db"
+    secret_file = tmp_path / "server.key"
+    secret_file.write_text("file-secret\n")
+    config_path = tmp_path / "config.yaml"
+    config = {
+        "security": {
+            "tokens": [
+                {
+                    "name": "test",
+                    "token": "hoard_sk_test",
+                    "scopes": ["search", "get", "memory", "sync", "ingest"],
+                }
+            ]
+        },
+        "storage": {"db_path": str(db_path)},
+        "write": {"server_secret_file": str(secret_file)},
+    }
+    save_config(config, config_path)
+
+    url = mcp_server(config_path)
+    status, resp = _call_mcp(url, "hoard_sk_test", "tools/list", {})
+    assert status == 200
+    assert resp["result"]["tools"]
+
+
 def test_http_mcp_inbox_put_and_sync(tmp_path: Path, mcp_server) -> None:
     original_home = os.environ.get("HOME")
     home_dir = tmp_path / "home"

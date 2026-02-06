@@ -62,10 +62,12 @@ hoard search "my notes"
 ### Recommended setup flow
 ```bash
 hoard init           # wizard: choose sources, file types, vectors
-export HOARD_SERVER_SECRET=$(python -c "import secrets; print(secrets.token_hex(32))")
-hoard serve          # start HTTP MCP server (default port 19850)
 hoard setup --all    # configure Claude Code / Codex / OpenClaw
+hoard setup --verify # verify server + write tools + client config
 ```
+
+By default, Hoard auto-generates a local server secret at `~/.hoard/server.key` (0600).
+`HOARD_SERVER_SECRET` still overrides the file when set.
 
 ---
 
@@ -133,13 +135,18 @@ hoard embeddings build
 
 ### Server
 ```bash
-export HOARD_SERVER_SECRET=$(python -c "import secrets; print(secrets.token_hex(32))")
 hoard serve                # HTTP MCP server (http://127.0.0.1:19850/mcp)
                          # SSE events: http://127.0.0.1:19850/events
 hoard serve --daemon
 hoard serve --status
 hoard serve --stop
 hoard serve --install-autostart
+```
+
+Local default: Hoard reads server secret from `~/.hoard/server.key` and auto-generates it if missing.
+Optional override:
+```bash
+export HOARD_SERVER_SECRET=your-secret
 ```
 
 To run in read-only mode without a server secret, set in `~/.hoard/config.yaml`:
@@ -157,17 +164,17 @@ pip install -e ".[watcher]"  # enable file watcher
 Cross-agent memory writes are supported via the HTTP server. Stdio mode is read-only.
 
 Requirements:
-- `HOARD_SERVER_SECRET` set in the environment (HMAC key for token lookup)
+- server secret available via either:
+  - `HOARD_SERVER_SECRET` environment variable, or
+  - `~/.hoard/server.key` (auto-generated local default)
 - `hoard serve` running
 
 ```bash
-export HOARD_SERVER_SECRET=$(python -c "import secrets; print(secrets.token_hex(32))")
 hoard serve
 ```
 
 Admin tasks (token management) use the same secret:
 ```bash
-export HOARD_SERVER_SECRET=...
 hoard tokens add claude-code --scopes search,get,memory,sync
 ```
 
