@@ -4,14 +4,18 @@ import os
 import secrets
 from pathlib import Path
 
+from hoard.core.config import default_data_path
+
 
 def server_secret_env_key(config: dict) -> str:
     return config.get("write", {}).get("server_secret_env", "HOARD_SERVER_SECRET")
 
 
 def server_secret_file_path(config: dict) -> Path:
-    raw_path = config.get("write", {}).get("server_secret_file", "~/.hoard/server.key")
-    return Path(raw_path).expanduser()
+    raw_path = config.get("write", {}).get("server_secret_file")
+    if raw_path:
+        return Path(raw_path).expanduser()
+    return default_data_path("server.key")
 
 
 def resolve_server_secret(config: dict) -> str | None:

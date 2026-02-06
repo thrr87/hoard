@@ -1,14 +1,17 @@
 from __future__ import annotations
 
 import json
+import ipaddress
 import os
 import secrets
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 from typing import List
@@ -26,11 +29,12 @@ from hoard.cli.instructions import (
     render_instruction_block,
     resolve_project_root,
 )
-from hoard.core.config import ensure_config_file, load_config, resolve_paths, save_config
+from hoard.core.config import default_data_path, ensure_config_file, load_config, resolve_paths, save_config
 from hoard.core.db.connection import connect, initialize_db
 from hoard.core.embeddings.model import EmbeddingError, EmbeddingModel
 from hoard.core.mcp.server import run_server
 from hoard.core.mcp.stdio import run_stdio
+from hoard.core.mcp.tools import is_write_tool
 from hoard.core.memory.store import memory_get, memory_prune, memory_put, memory_search
 from hoard.core.onboarding import (
     detect_chrome_bookmarks_paths,
@@ -49,14 +53,52 @@ from hoard.core.security.server_secret import (
 from hoard.core.sync.background import BackgroundSync
 from hoard.core.sync.service import run_sync_with_lock
 from hoard.core.sync.watcher import WATCHDOG_AVAILABLE
+from hoard.sdk.retry import run_with_retry, should_retry_http_exception
 
 console = Console()
+DEFAULT_AGENT_SCOPES = ["search", "get", "memory", "sync", "ingest"]
+
+
+def _server_base_url(config: dict) -> str:
+    host = config.get("server", {}).get("host", "127.0.0.1")
+    port = int(config.get("server", {}).get("port", 19850))
+    return f"http://{host}:{port}"
+
+
+def _normalize_base_url(url: str) -> str:
+    value = (url or "").strip()
+    if not value:
+        raise click.ClickException("Missing URL.")
+
+    parsed = urllib.parse.urlparse(value)
+    if not parsed.scheme:
+        parsed = urllib.parse.urlparse(f"http://{value}")
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        raise click.ClickException("URL must be a valid http(s) address.")
+
+    path = parsed.path.rstrip("/")
+    if path.endswith("/mcp"):
+        path = path[:-4]
+    normalized = parsed._replace(path=path.rstrip("/"), params="", query="", fragment="")
+    return urllib.parse.urlunparse(normalized).rstrip("/")
+
+
+def _normalize_mcp_url(url: str) -> str:
+    base = _normalize_base_url(url)
+    return f"{base}/mcp"
 
 
 def _mcp_url(config: dict) -> str:
-    host = config.get("server", {}).get("host", "127.0.0.1")
-    port = int(config.get("server", {}).get("port", 19850))
-    return f"http://{host}:{port}/mcp"
+    return _normalize_mcp_url(_server_base_url(config))
+
+
+def _persistence_warning_suffix(method: str, params: dict) -> str:
+    if method != "tools/call":
+        return ""
+    tool_name = params.get("name") if isinstance(params, dict) else None
+    if isinstance(tool_name, str) and is_write_tool(tool_name):
+        return " Any attempted write may not have been persisted."
+    return ""
 
 
 def _call_mcp(config: dict, method: str, params: dict, *, token_override: str | None = None) -> dict:
@@ -72,12 +114,16 @@ def _call_mcp(config: dict, method: str, params: dict, *, token_override: str | 
         },
     )
     try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
+        def _send():
+            return urllib.request.urlopen(req, timeout=30)
+
+        with run_with_retry(_send, should_retry=should_retry_http_exception) as resp:
             payload = json.loads(resp.read())
     except urllib.error.HTTPError as exc:
         raise click.ClickException(f"Server error: {exc}") from exc
     except urllib.error.URLError as exc:
-        raise click.ClickException(f"Server unreachable: {exc}") from exc
+        suffix = _persistence_warning_suffix(method, params)
+        raise click.ClickException(f"Server unreachable: {exc}.{suffix}") from exc
 
     if isinstance(payload, dict) and payload.get("error"):
         message = payload["error"].get("message", payload["error"])
@@ -160,7 +206,7 @@ def init_command(
         console.print(f"[yellow]![/yellow] Sync skipped: {exc}")
 
     if run_setup:
-        setup_command(
+        _run_setup_local(
             claude=False,
             codex=False,
             openclaw=False,
@@ -687,7 +733,7 @@ def orchestrate_init_command(config_path: Path | None) -> None:
         orchestrator["registration_token"] = token
 
     artifacts = config.setdefault("artifacts", {})
-    default_path = artifacts.get("blob_path") or str(Path.home() / ".hoard" / "artifacts")
+    default_path = artifacts.get("blob_path") or str(default_data_path("artifacts"))
     blob_path = click.prompt("Artifact store path", default=default_path)
     artifacts["blob_path"] = blob_path
 
@@ -1175,9 +1221,31 @@ def sync_status_command(config_path: Path | None) -> None:
     connectors_status_command(config_path)
 
 
+def _is_loopback_host(host: str) -> bool:
+    normalized = (host or "").strip().lower()
+    if normalized in {"127.0.0.1", "localhost", "::1", "[::1]"}:
+        return True
+    try:
+        return ipaddress.ip_address(normalized).is_loopback
+    except ValueError:
+        return False
+
+
+def _require_remote_bind_opt_in(host: str, allow_remote: bool) -> None:
+    if _is_loopback_host(host):
+        return
+    if allow_remote:
+        return
+    raise click.ClickException(
+        "Refusing non-loopback bind without explicit remote opt-in.\n"
+        "Use --allow-remote or set server.allow_remote: true in config."
+    )
+
+
 @cli.command("serve")
 @click.option("--host", default=None, help="Server host")
 @click.option("--port", default=None, type=int, help="Server port")
+@click.option("--allow-remote", is_flag=True, default=False, help="Allow non-loopback bind addresses")
 @click.option("--daemon", is_flag=True, default=False, help="Run as background daemon")
 @click.option("--status", is_flag=True, default=False, help="Check daemon status")
 @click.option("--stop", is_flag=True, default=False, help="Stop daemon")
@@ -1191,6 +1259,7 @@ def sync_status_command(config_path: Path | None) -> None:
 def serve_command(
     host: str | None,
     port: int | None,
+    allow_remote: bool,
     daemon: bool,
     status: bool,
     stop: bool,
@@ -1201,6 +1270,7 @@ def serve_command(
     server_config = config.get("server", {})
     host = host or server_config.get("host", "127.0.0.1")
     port = port or int(server_config.get("port", 19850))
+    allow_remote = allow_remote or bool(server_config.get("allow_remote", False))
 
     if status:
         _serve_status()
@@ -1209,8 +1279,10 @@ def serve_command(
         _serve_stop()
         return
     if install_autostart:
-        _install_autostart(host, port)
+        _install_autostart(host, port, allow_remote=allow_remote)
         return
+
+    _require_remote_bind_opt_in(host, allow_remote)
 
     if config.get("write", {}).get("enabled", True):
         had_secret = bool(resolve_server_secret(config))
@@ -1222,7 +1294,7 @@ def serve_command(
             console.print(f"Generated server secret in {server_secret_file_path(config)}")
 
     if daemon:
-        _serve_daemon(host, port, no_migrate=no_migrate)
+        _serve_daemon(host, port, no_migrate=no_migrate, allow_remote=allow_remote)
         return
 
     background = BackgroundSync(config=config, config_path=None, log=console.print)
@@ -1240,10 +1312,19 @@ def mcp_group() -> None:
 @mcp_group.command("serve")
 @click.option("--host", default="127.0.0.1", show_default=True)
 @click.option("--port", default=19850, show_default=True)
+@click.option("--allow-remote", is_flag=True, default=False, help="Allow non-loopback bind addresses")
 @click.option("--no-migrate", is_flag=True, default=False, help="Skip automatic schema migrations")
 @click.option("--config", "config_path", type=click.Path(path_type=Path))
-def mcp_serve_command(host: str, port: int, no_migrate: bool, config_path: Path | None) -> None:
+def mcp_serve_command(
+    host: str,
+    port: int,
+    allow_remote: bool,
+    no_migrate: bool,
+    config_path: Path | None,
+) -> None:
     config = load_config(config_path)
+    allow_remote = allow_remote or bool(config.get("server", {}).get("allow_remote", False))
+    _require_remote_bind_opt_in(host, allow_remote)
     if config.get("write", {}).get("enabled", True):
         had_secret = bool(resolve_server_secret(config))
         try:
@@ -1323,7 +1404,8 @@ def instructions_command(
     console.print(f"Instruction update complete. Changed {len(result.applied)} file(s).")
 
 
-@cli.command("setup")
+@cli.group("setup", invoke_without_command=True)
+@click.pass_context
 @click.option("--claude", is_flag=True, default=False, help="Configure Claude Code")
 @click.option("--codex", is_flag=True, default=False, help="Configure Codex")
 @click.option("--openclaw", is_flag=True, default=False, help="Configure OpenClaw")
@@ -1332,7 +1414,71 @@ def instructions_command(
 @click.option("--verify", is_flag=True, default=False, help="Verify integrations")
 @click.option("--uninstall", type=str, default=None, help="Uninstall client integration")
 @click.option("--no-instructions", is_flag=True, default=False, help="Skip instruction updates")
-def setup_command(
+def setup_group(
+    ctx: click.Context,
+    claude: bool,
+    codex: bool,
+    openclaw: bool,
+    setup_all: bool,
+    project_scope: bool,
+    verify: bool,
+    uninstall: str | None,
+    no_instructions: bool,
+) -> None:
+    if ctx.invoked_subcommand:
+        return
+    _run_setup_local(
+        claude=claude,
+        codex=codex,
+        openclaw=openclaw,
+        setup_all=setup_all,
+        project_scope=project_scope,
+        verify=verify,
+        uninstall=uninstall,
+        no_instructions=no_instructions,
+    )
+
+
+@setup_group.command("remote")
+@click.option("--url", required=True, help="Remote Hoard URL or MCP endpoint.")
+@click.option("--token", default=None, help="Existing agent token (recommended).")
+@click.option(
+    "--admin-token",
+    default=None,
+    help="Admin token for automation-only auto-provisioning (advanced).",
+)
+@click.option("--claude", is_flag=True, default=False, help="Configure Claude Code")
+@click.option("--codex", is_flag=True, default=False, help="Configure Codex")
+@click.option("--openclaw", is_flag=True, default=False, help="Configure OpenClaw")
+@click.option("--all", "setup_all", is_flag=True, default=False, help="Configure all detected clients")
+@click.option("--project-scope", is_flag=True, default=False, help="Use project-scope config for Claude")
+@click.option("--dry-run", is_flag=True, default=False, help="Print actions without writing files")
+def setup_remote_command(
+    url: str,
+    token: str | None,
+    admin_token: str | None,
+    claude: bool,
+    codex: bool,
+    openclaw: bool,
+    setup_all: bool,
+    project_scope: bool,
+    dry_run: bool,
+) -> None:
+    _run_setup_remote(
+        url=url,
+        token=token,
+        admin_token=admin_token,
+        claude=claude,
+        codex=codex,
+        openclaw=openclaw,
+        setup_all=setup_all,
+        project_scope=project_scope,
+        dry_run=dry_run,
+    )
+
+
+def _run_setup_local(
+    *,
     claude: bool,
     codex: bool,
     openclaw: bool,
@@ -1355,7 +1501,7 @@ def setup_command(
 
     host = config.get("server", {}).get("host", "127.0.0.1")
     port = int(config.get("server", {}).get("port", 19850))
-    url = f"http://{host}:{port}/mcp"
+    url = _normalize_mcp_url(f"http://{host}:{port}")
 
     targets = _resolve_setup_targets(claude, codex, openclaw, setup_all)
     if not targets:
@@ -1409,6 +1555,110 @@ def setup_command(
         instructions_result=instructions_result,
     )
 
+
+def _run_setup_remote(
+    *,
+    url: str,
+    token: str | None,
+    admin_token: str | None,
+    claude: bool,
+    codex: bool,
+    openclaw: bool,
+    setup_all: bool,
+    project_scope: bool,
+    dry_run: bool,
+) -> None:
+    mcp_url = _normalize_mcp_url(url)
+    base_url = _normalize_base_url(url)
+    targets = _resolve_setup_targets(claude, codex, openclaw, setup_all)
+    if not targets:
+        console.print("No clients selected.")
+        return
+
+    console.print(
+        "Credential flow:\n"
+        "  Recommended: --token with a pre-provisioned agent token.\n"
+        "  Advanced automation: --admin-token for remote auto-provisioning."
+    )
+
+    if not token and not admin_token:
+        raise click.ClickException("Provide --token (recommended) or --admin-token (advanced).")
+
+    health = _remote_health(base_url)
+    if health is None:
+        console.print(f"[yellow][!][/yellow] Health check unavailable at {base_url}/health")
+    else:
+        status_text = "ok" if health.get("status") == "ok" else "degraded"
+        console.print(f"Remote health: {status_text}")
+
+    token_map: dict[str, str] = {}
+    if token:
+        _validate_remote_token(mcp_url, token, label="token")
+        for target in targets:
+            token_map[target] = token
+    else:
+        _validate_remote_token(mcp_url, admin_token, label="admin-token")
+        for target in targets:
+            provisioned = _provision_remote_token(
+                mcp_url=mcp_url,
+                admin_token=admin_token or "",
+                target=target,
+            )
+            token_map[target] = provisioned
+            console.print(f"Provisioned token for {target}.")
+
+    if dry_run:
+        console.print("Dry run: no files were changed.")
+        _print_remote_setup_next_steps(
+            mcp_url=mcp_url,
+            targets=targets,
+            token_map=token_map,
+            project_scope=project_scope,
+        )
+        return
+
+    if "claude" in targets:
+        if project_scope:
+            _configure_claude_project_scope(mcp_url)
+        else:
+            _configure_claude_user_scope(mcp_url, token_map["claude"])
+    if "codex" in targets:
+        _configure_codex(mcp_url)
+    if "openclaw" in targets:
+        _configure_openclaw(mcp_url, token_map["openclaw"])
+
+    _print_remote_setup_next_steps(
+        mcp_url=mcp_url,
+        targets=targets,
+        token_map=token_map,
+        project_scope=project_scope,
+    )
+
+
+def _print_remote_setup_next_steps(
+    *,
+    mcp_url: str,
+    targets: list[str],
+    token_map: dict[str, str],
+    project_scope: bool,
+) -> None:
+    console.print("\nRemote setup complete.")
+    console.print(f"Remote MCP endpoint: {mcp_url}")
+    if "claude" in targets and project_scope:
+        console.print("\nClaude project-scope token setup:")
+        console.print(f'  export HOARD_TOKEN="{token_map["claude"]}"')
+    if "codex" in targets:
+        console.print("\nCodex token setup:")
+        console.print(f'  export HOARD_TOKEN="{token_map["codex"]}"')
+    if "claude" in targets and not project_scope:
+        console.print("\nClaude Code uses the configured token directly.")
+    if "openclaw" in targets:
+        console.print("\nOpenClaw stores token in ~/.openclaw/openclaw.json.")
+    console.print("\nNext steps:")
+    console.print("  1. Restart your AI tools")
+    console.print("  2. Run hoard setup --verify for local config checks")
+
+
 def _check(label: str, ok: bool) -> None:
     status = "[green]✓[/green]" if ok else "[red]✗[/red]"
     console.print(f"{status} {label}")
@@ -1455,7 +1705,7 @@ def _print_setup_summary(
         console.print(f'  export HOARD_TOKEN="{token_value}"')
 
     console.print("\nNext steps:")
-    console.print(f"  1. Verify setup: hoard setup --verify")
+    console.print("  1. Verify setup: hoard setup --verify")
     console.print(f"  2. Confirm server: http://{host}:{port}/mcp")
     console.print("  3. Restart your AI tools to load updated MCP config")
 
@@ -1624,7 +1874,7 @@ def _configure_inbox(config: dict, inbox_path: Path | None) -> None:
     )
 
     if inbox_path is None:
-        default_path = inbox.get("path") or str(Path.home() / ".hoard" / "inbox")
+        default_path = inbox.get("path") or str(default_data_path("inbox"))
         choice = click.prompt("Agent inbox folder", default=default_path)
         inbox_path = Path(choice).expanduser()
 
@@ -1825,7 +2075,7 @@ def _ensure_token(config: dict, name: str) -> str:
             "name": "agent_register",
             "arguments": {
                 "agent_id": name,
-                "scopes": ["search", "get", "memory", "sync", "ingest"],
+                "scopes": DEFAULT_AGENT_SCOPES,
                 "overwrite": True,
             },
         },
@@ -1833,6 +2083,48 @@ def _ensure_token(config: dict, name: str) -> str:
     token_value = result.get("token")
     if not token_value:
         raise click.ClickException("Failed to provision token.")
+    return token_value
+
+
+def _validate_remote_token(mcp_url: str, token: str | None, label: str) -> None:
+    if not token:
+        raise click.ClickException(f"{label} is required.")
+    response = _mcp_jsonrpc_url(mcp_url, token, "tools/list", {})
+    if response.get("error"):
+        message = response["error"].get("message", "unknown error")
+        raise click.ClickException(f"{label} validation failed: {message}")
+
+
+def _remote_agent_id(target: str) -> str:
+    host = socket.gethostname().lower()
+    safe_host = "".join(ch if ch.isalnum() or ch in {"-", "_"} else "-" for ch in host).strip("-_")
+    safe_host = safe_host or "host"
+    return f"{safe_host}-{target}"
+
+
+def _provision_remote_token(*, mcp_url: str, admin_token: str, target: str) -> str:
+    result = _mcp_jsonrpc_url(
+        mcp_url,
+        admin_token,
+        "tools/call",
+        {
+            "name": "agent_register",
+            "arguments": {
+                "agent_id": _remote_agent_id(target),
+                "scopes": DEFAULT_AGENT_SCOPES,
+                "overwrite": True,
+            },
+        },
+    )
+    if result.get("error"):
+        message = result["error"].get("message", "unknown error")
+        raise click.ClickException(f"Failed to provision token for {target}: {message}")
+    try:
+        tool_result = result["result"]["content"][0]["text"]
+        payload = json.loads(tool_result)
+        token_value = payload["token"]
+    except Exception as exc:
+        raise click.ClickException(f"Failed to parse token provisioning response for {target}.") from exc
     return token_value
 
 
@@ -1853,21 +2145,58 @@ def _ensure_server_running(host: str, port: int) -> None:
 
 
 def _is_server_healthy(host: str, port: int) -> bool:
-    import urllib.error
-    import urllib.request
-
-    try:
-        req = urllib.request.Request(
-            f"http://{host}:{port}/mcp",
-            data=json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}).encode(),
-            headers={"Content-Type": "application/json", "Authorization": "Bearer invalid"},
-        )
-        urllib.request.urlopen(req, timeout=2)
-    except urllib.error.HTTPError as exc:
-        return exc.code in {401, 403}
-    except Exception:
+    base_url = f"http://{host}:{port}"
+    status, health = _remote_health_probe(base_url, retry=False)
+    if isinstance(health, dict):
+        if not health.get("db_ready"):
+            return False
+        return not bool(health.get("migrations_pending"))
+    if status != "missing":
         return False
-    return True
+
+    # Backward compatibility for older servers that do not expose /health yet.
+    response = _mcp_jsonrpc_url(base_url, "invalid", "tools/list", {}, retry=False)
+    if not isinstance(response, dict):
+        return False
+    error = response.get("error")
+    if isinstance(error, dict):
+        message = str(error.get("message", "")).lower()
+        return "invalid token" in message or "missing bearer token" in message
+    return False
+
+
+def _remote_health(base_url: str, *, retry: bool = True) -> dict | None:
+    status, payload = _remote_health_probe(base_url, retry=retry)
+    if status in {"ok", "degraded"}:
+        return payload
+    return None
+
+
+def _remote_health_probe(base_url: str, *, retry: bool = True) -> tuple[str, dict | None]:
+    target = f"{_normalize_base_url(base_url)}/health"
+    req = urllib.request.Request(target, method="GET")
+    try:
+        def _send():
+            return urllib.request.urlopen(req, timeout=5)
+
+        if retry:
+            response = run_with_retry(_send, should_retry=should_retry_http_exception)
+        else:
+            response = _send()
+
+        with response as resp:
+            payload = json.loads(resp.read())
+        return "ok", payload
+    except urllib.error.HTTPError as exc:
+        if exc.code == 404:
+            return "missing", None
+        try:
+            payload = json.loads(exc.read())
+            return "degraded", payload
+        except json.JSONDecodeError:
+            return "error", None
+    except (urllib.error.URLError, TimeoutError, OSError, ValueError):
+        return "unreachable", None
 
 
 def _configure_claude_user_scope(url: str, token: str) -> None:
@@ -1929,6 +2258,7 @@ def _replace_toml_block(text: str, block_name: str, block_content: str) -> str:
 
 
 def _configure_openclaw(url: str, token: str) -> None:
+    base_url = _normalize_base_url(url)
     base_dir = Path.home() / ".openclaw" / "skills" / "hoard"
     scripts_dir = base_dir / "scripts"
     scripts_dir.mkdir(parents=True, exist_ok=True)
@@ -1954,7 +2284,7 @@ def _configure_openclaw(url: str, token: str) -> None:
     skills["hoard"] = {
         "enabled": True,
         "apiKey": token,
-        "env": {"HOARD_URL": url},
+        "env": {"HOARD_URL": base_url},
     }
     config_path.write_text(json.dumps(data, indent=2))
     console.print("Configuring OpenClaw... done")
@@ -2018,19 +2348,38 @@ Inbox put:
 def _openclaw_client_script() -> str:
     return """#!/usr/bin/env python3
 import argparse
-import os
 import json
+import os
 import sys
-import urllib.request
 import urllib.error
+import urllib.parse
+import urllib.request
+
+from hoard.sdk.retry import run_with_retry, should_retry_http_exception
 
 HOARD_URL = os.environ.get("HOARD_URL", "http://127.0.0.1:19850")
 HOARD_TOKEN = os.environ.get("HOARD_TOKEN", "")
 
 
+def _normalize_base_url(url: str) -> str:
+    raw = (url or "").strip()
+    parsed = urllib.parse.urlparse(raw)
+    if not parsed.scheme:
+        parsed = urllib.parse.urlparse(f"http://{raw}")
+    path = parsed.path.rstrip("/")
+    if path.endswith("/mcp"):
+        path = path[:-4]
+    normalized = parsed._replace(path=path.rstrip("/"), params="", query="", fragment="")
+    return urllib.parse.urlunparse(normalized).rstrip("/")
+
+
+def _mcp_url() -> str:
+    return f"{_normalize_base_url(HOARD_URL)}/mcp"
+
+
 def _call_mcp(method: str, params: dict) -> dict:
     req = urllib.request.Request(
-        f"{HOARD_URL}/mcp",
+        _mcp_url(),
         data=json.dumps({"jsonrpc": "2.0", "id": 1, "method": method, "params": params}).encode(),
         headers={
             "Content-Type": "application/json",
@@ -2038,10 +2387,18 @@ def _call_mcp(method: str, params: dict) -> dict:
         },
     )
     try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
+        def _send():
+            return urllib.request.urlopen(req, timeout=30)
+
+        with run_with_retry(_send, should_retry=should_retry_http_exception) as resp:
             return json.loads(resp.read())
+    except urllib.error.HTTPError as exc:
+        try:
+            return json.loads(exc.read())
+        except Exception:
+            return {"error": {"message": str(exc)}}
     except urllib.error.URLError as exc:
-        return {"error": str(exc)}
+        return {"error": {"message": f"{exc}. Any attempted write may not have been persisted."}}
 
 
 def _call_tool(name: str, arguments: dict) -> dict:
@@ -2276,16 +2633,34 @@ def _check_write_smoke(host: str, port: int, token: str) -> tuple[bool, str]:
 
 
 def _mcp_jsonrpc(host: str, port: int, token: str, method: str, params: dict) -> dict:
-    import urllib.error
-    import urllib.request
+    return _mcp_jsonrpc_url(f"http://{host}:{port}", token, method, params)
 
+
+def _mcp_jsonrpc_url(
+    base_url: str,
+    token: str,
+    method: str,
+    params: dict,
+    *,
+    retry: bool = True,
+) -> dict:
+    target = _normalize_mcp_url(base_url)
     try:
         req = urllib.request.Request(
-            f"http://{host}:{port}/mcp",
+            target,
             data=json.dumps({"jsonrpc": "2.0", "id": 1, "method": method, "params": params}).encode(),
             headers={"Content-Type": "application/json", "Authorization": f"Bearer {token}"},
         )
-        with urllib.request.urlopen(req, timeout=5) as resp:
+
+        def _send():
+            return urllib.request.urlopen(req, timeout=5)
+
+        if retry:
+            response = run_with_retry(_send, should_retry=should_retry_http_exception)
+        else:
+            response = _send()
+
+        with response as resp:
             return json.loads(resp.read())
     except urllib.error.HTTPError as exc:
         try:
@@ -2293,8 +2668,13 @@ def _mcp_jsonrpc(host: str, port: int, token: str, method: str, params: dict) ->
         except Exception:
             payload = {"error": {"message": str(exc)}}
         return payload
-    except Exception:
-        return {"error": {"message": "request failed"}}
+    except Exception as exc:
+        suffix = _persistence_warning_suffix(method, params)
+        return {
+            "error": {
+                "message": f"request failed: {exc}.{suffix}",
+            }
+        }
 
 
 def _uninstall_integration(client: str) -> None:
@@ -2318,12 +2698,17 @@ def _uninstall_integration(client: str) -> None:
 
 
 def _daemon_paths() -> tuple[Path, Path]:
-    base = Path.home() / ".hoard"
+    base = default_data_path()
     base.mkdir(parents=True, exist_ok=True)
     return base / "hoard.pid", base / "hoard.log"
 
 
-def _serve_daemon(host: str, port: int, no_migrate: bool = False) -> None:
+def _serve_daemon(
+    host: str,
+    port: int,
+    no_migrate: bool = False,
+    allow_remote: bool = False,
+) -> None:
     pid_path, log_path = _daemon_paths()
     if pid_path.exists():
         console.print("Hoard server already running.")
@@ -2331,6 +2716,8 @@ def _serve_daemon(host: str, port: int, no_migrate: bool = False) -> None:
 
     log_file = log_path.open("ab")
     command = [sys.executable, "-m", "hoard.cli.main", "serve", "--host", host, "--port", str(port)]
+    if allow_remote:
+        command.append("--allow-remote")
     if no_migrate:
         command.append("--no-migrate")
     process = subprocess.Popen(
@@ -2377,7 +2764,13 @@ def _pid_alive(pid: int) -> bool:
         return False
 
 
-def _install_autostart(host: str, port: int) -> None:
+def _install_autostart(host: str, port: int, allow_remote: bool = False) -> None:
+    remote_args = (
+        "      <string>--allow-remote</string>\n"
+        if allow_remote
+        else ""
+    )
+    remote_flag = " --allow-remote" if allow_remote else ""
     if sys.platform == "darwin":
         plist_path = Path.home() / "Library/LaunchAgents/com.hoard.server.plist"
         plist_path.parent.mkdir(parents=True, exist_ok=True)
@@ -2394,7 +2787,7 @@ def _install_autostart(host: str, port: int) -> None:
       <string>serve</string>
       <string>--host</string><string>{host}</string>
       <string>--port</string><string>{port}</string>
-    </array>
+{remote_args}    </array>
     <key>RunAtLoad</key><true/>
     <key>KeepAlive</key><true/>
   </dict>
@@ -2409,7 +2802,7 @@ def _install_autostart(host: str, port: int) -> None:
 Description=Hoard server
 
 [Service]
-ExecStart={sys.executable} -m hoard.cli.main serve --host {host} --port {port}
+ExecStart={sys.executable} -m hoard.cli.main serve --host {host} --port {port}{remote_flag}
 Restart=always
 
 [Install]

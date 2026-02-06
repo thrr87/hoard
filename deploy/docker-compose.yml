@@ -1,0 +1,44 @@
+services:
+  hoard:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    environment:
+      HOARD_DATA_DIR: /data
+      HOARD_SERVER_SECRET: ${HOARD_SERVER_SECRET}
+    command: ["serve", "--host", "0.0.0.0", "--allow-remote", "--port", "19850"]
+    expose:
+      - "19850"
+    volumes:
+      - hoard_data:/data
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request,sys;sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:19850/health', timeout=2).status==200 else 1)",
+        ]
+      interval: 10s
+      timeout: 3s
+      retries: 6
+
+  caddy:
+    image: caddy:2-alpine
+    depends_on:
+      hoard:
+        condition: service_healthy
+    environment:
+      HOARD_DOMAIN: ${HOARD_DOMAIN}
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+
+volumes:
+  hoard_data:
+  caddy_data:
+  caddy_config:

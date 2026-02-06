@@ -137,19 +137,31 @@ hoard embeddings build
 ```bash
 hoard serve                # HTTP MCP server (http://127.0.0.1:19850/mcp)
                          # SSE events: http://127.0.0.1:19850/events
+                         # Health: http://127.0.0.1:19850/health
 hoard serve --daemon
 hoard serve --status
 hoard serve --stop
 hoard serve --install-autostart
 ```
 
-Local default: Hoard reads server secret from `~/.hoard/server.key` and auto-generates it if missing.
+Hoard defaults to loopback-only bind. To expose a non-loopback host (for remote clients), you must opt in:
+```bash
+hoard serve --host 0.0.0.0 --allow-remote
+```
+
+Local default: Hoard reads server secret from `${HOARD_DATA_DIR:-~/.hoard}/server.key` and auto-generates it if missing.
 Optional override:
 ```bash
 export HOARD_SERVER_SECRET=your-secret
 ```
 
-To run in read-only mode without a server secret, set in `~/.hoard/config.yaml`:
+### Data Directory
+By default Hoard stores state under `~/.hoard`. Set `HOARD_DATA_DIR` to move all default paths (config/db/secret/artifacts/daemon files):
+```bash
+export HOARD_DATA_DIR=/var/lib/hoard
+```
+
+To run in read-only mode without a server secret, set in `${HOARD_DATA_DIR:-~/.hoard}/config.yaml`:
 ```yaml
 write:
   enabled: false
@@ -166,7 +178,7 @@ Cross-agent memory writes are supported via the HTTP server. Stdio mode is read-
 Requirements:
 - server secret available via either:
   - `HOARD_SERVER_SECRET` environment variable, or
-  - `~/.hoard/server.key` (auto-generated local default)
+  - `${HOARD_DATA_DIR:-~/.hoard}/server.key` (auto-generated local default)
 - `hoard serve` running
 
 ```bash
@@ -185,9 +197,17 @@ hoard setup --claude
 hoard setup --claude --project-scope
 hoard setup --codex
 hoard setup --openclaw
+hoard setup remote --url https://hoard.example.com --token hoard_sk_xxx
+hoard setup remote --url https://hoard.example.com --admin-token hoard_admin_xxx  # automation
 hoard setup --verify
 hoard setup --uninstall openclaw
 ```
+
+`hoard setup remote` credential hierarchy:
+- Recommended: `--token` with a pre-provisioned agent token.
+- Advanced automation: `--admin-token` (auto-provisions one token per client type).
+
+For production remote hosting (Docker + Caddy TLS), see `docs/REMOTE_DEPLOYMENT.md`.
 
 ### Diagnostics
 ```bash
@@ -236,7 +256,7 @@ Beyond `search/get/get_chunk/sync`, Hoard exposes tools for:
 
 ## Connectors
 
-Enable in `~/.hoard/config.yaml`:
+Enable in `${HOARD_DATA_DIR:-~/.hoard}/config.yaml`:
 
 ```yaml
 connectors:

@@ -6,7 +6,7 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from hoard.core.config import resolve_paths
+from hoard.core.config import default_data_path, resolve_paths
 from hoard.core.db.connection import connect, initialize_db
 from hoard.core.ingest.registry import iter_enabled_connectors
 from hoard.core.ingest.sync import sync_connector
@@ -104,7 +104,7 @@ def _stats_to_dict(stats: SyncStats) -> Dict[str, Any]:
 
 
 def _lock_path() -> Path:
-    base = Path.home() / ".hoard"
+    base = default_data_path()
     try:
         base.mkdir(parents=True, exist_ok=True)
     except PermissionError:

@@ -75,6 +75,7 @@ DEFAULT_CONFIG = {
     "server": {
         "host": "127.0.0.1",
         "port": 19850,
+        "allow_remote": False,
     },
     "vectors": {
         "enabled": False,
@@ -182,6 +183,12 @@ DEFAULT_CONFIG = {
     },
 }
 
+HOARD_DATA_DIR_ENV = "HOARD_DATA_DIR"
+_DEFAULT_RELATIVE_DB_PATH = "hoard.db"
+_DEFAULT_RELATIVE_SECRET_PATH = "server.key"
+_DEFAULT_RELATIVE_ARTIFACTS_PATH = "artifacts"
+_DEFAULT_RELATIVE_CONFIG_PATH = "config.yaml"
+
 
 @dataclass
 class ConfigPaths:
@@ -189,8 +196,17 @@ class ConfigPaths:
     db_path: Path
 
 
+def get_data_dir() -> Path:
+    raw = os.environ.get(HOARD_DATA_DIR_ENV, "~/.hoard")
+    return Path(raw).expanduser()
+
+
+def default_data_path(*parts: str) -> Path:
+    return get_data_dir().joinpath(*parts)
+
+
 def get_default_config_path() -> Path:
-    return Path.home() / ".hoard" / "config.yaml"
+    return default_data_path(_DEFAULT_RELATIVE_CONFIG_PATH)
 
 
 def _deep_merge(base: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, Any]:
@@ -244,13 +260,39 @@ def _expand_config_paths(config: Dict[str, Any]) -> Dict[str, Any]:
     return config
 
 
+def _path_is_explicit(raw: Dict[str, Any], keys: tuple[str, ...]) -> bool:
+    node: Any = raw
+    for key in keys:
+        if not isinstance(node, dict) or key not in node:
+            return False
+        node = node[key]
+    return bool(node)
+
+
+def _apply_data_dir_defaults(config: Dict[str, Any], raw: Dict[str, Any]) -> Dict[str, Any]:
+    data_dir = get_data_dir()
+
+    if not _path_is_explicit(raw, ("storage", "db_path")):
+        config.setdefault("storage", {})["db_path"] = str(data_dir / _DEFAULT_RELATIVE_DB_PATH)
+
+    if not _path_is_explicit(raw, ("write", "server_secret_file")):
+        config.setdefault("write", {})["server_secret_file"] = str(data_dir / _DEFAULT_RELATIVE_SECRET_PATH)
+
+    if not _path_is_explicit(raw, ("artifacts", "blob_path")):
+        config.setdefault("artifacts", {})["blob_path"] = str(data_dir / _DEFAULT_RELATIVE_ARTIFACTS_PATH)
+
+    return config
+
+
 def load_config(path: Path | None = None) -> Dict[str, Any]:
     config_path = path or get_default_config_path()
     if not config_path.exists():
-        return _expand_config_paths(copy.deepcopy(DEFAULT_CONFIG))
+        base = copy.deepcopy(DEFAULT_CONFIG)
+        return _expand_config_paths(_apply_data_dir_defaults(base, {}))
 
     data = yaml.safe_load(config_path.read_text()) or {}
     merged = _deep_merge(copy.deepcopy(DEFAULT_CONFIG), data)
+    merged = _apply_data_dir_defaults(merged, data)
     return _expand_config_paths(merged)
 
 
@@ -258,7 +300,9 @@ def ensure_config_file(path: Path | None = None) -> Path:
     config_path = path or get_default_config_path()
     config_path.parent.mkdir(parents=True, exist_ok=True)
     if not config_path.exists():
-        save_config(copy.deepcopy(DEFAULT_CONFIG), config_path)
+        base = copy.deepcopy(DEFAULT_CONFIG)
+        config = _apply_data_dir_defaults(base, {})
+        save_config(config, config_path)
     return config_path
 
 
@@ -284,5 +328,9 @@ def save_config(config: Dict[str, Any], path: Path | None = None) -> Path:
 
 def resolve_paths(config: Dict[str, Any], path: Path | None = None) -> ConfigPaths:
     config_path = path or get_default_config_path()
-    db_path = Path(config.get("storage", {}).get("db_path", "~/.hoard/hoard.db")).expanduser()
+    db_path_value = config.get("storage", {}).get("db_path")
+    if db_path_value:
+        db_path = Path(db_path_value).expanduser()
+    else:
+        db_path = default_data_path(_DEFAULT_RELATIVE_DB_PATH)
     return ConfigPaths(config_path=config_path, db_path=db_path)

@@ -1,0 +1,5 @@
+{$HOARD_DOMAIN} {
+    @hoard path /mcp* /events* /health* /sync_status*
+    reverse_proxy @hoard hoard:19850
+    respond "Not found" 404
+}
