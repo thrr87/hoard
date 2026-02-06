@@ -83,6 +83,8 @@ DEFAULT_CONFIG = {
     "write": {
         "enabled": True,
         "server_secret_env": "HOARD_SERVER_SECRET",
+        "server_secret_file": "~/.hoard/server.key",
+        "auto_generate_server_secret": True,
         "database": {
             "busy_timeout_ms": 5000,
         },
@@ -217,6 +219,10 @@ def _expand_config_paths(config: Dict[str, Any]) -> Dict[str, Any]:
     artifacts = config.get("artifacts", {})
     if "blob_path" in artifacts:
         artifacts["blob_path"] = _expand_path(artifacts["blob_path"])
+
+    write_cfg = config.get("write", {})
+    if "server_secret_file" in write_cfg:
+        write_cfg["server_secret_file"] = _expand_path(write_cfg["server_secret_file"])
 
     connectors = config.get("connectors", {})
     for connector in connectors.values():

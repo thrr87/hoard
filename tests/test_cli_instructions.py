@@ -98,6 +98,7 @@ def test_setup_applies_instructions_when_interactive(tmp_path: Path, monkeypatch
     monkeypatch.chdir(project_dir)
 
     monkeypatch.setattr(cli_main, "_ensure_server_running", lambda host, port: None)
+    monkeypatch.setattr(cli_main, "_ensure_token", lambda config, name: "hoard_sk_test")
     monkeypatch.setattr(cli_main, "_is_interactive_session", lambda: True)
 
     runner = CliRunner()
@@ -106,6 +107,8 @@ def test_setup_applies_instructions_when_interactive(tmp_path: Path, monkeypatch
     assert result.exit_code == 0
     assert (project_dir / "AGENTS.md").exists()
     assert "<!-- HOARD:START -->" in (project_dir / "AGENTS.md").read_text()
+    assert "Instructions" in result.output
+    assert "applied" in result.output
 
 
 def test_setup_skips_instructions_with_flag(tmp_path: Path, monkeypatch) -> None:
@@ -119,6 +122,7 @@ def test_setup_skips_instructions_with_flag(tmp_path: Path, monkeypatch) -> None
     monkeypatch.chdir(project_dir)
 
     monkeypatch.setattr(cli_main, "_ensure_server_running", lambda host, port: None)
+    monkeypatch.setattr(cli_main, "_ensure_token", lambda config, name: "hoard_sk_test")
     monkeypatch.setattr(cli_main, "_is_interactive_session", lambda: True)
 
     runner = CliRunner()
@@ -127,6 +131,7 @@ def test_setup_skips_instructions_with_flag(tmp_path: Path, monkeypatch) -> None
     assert result.exit_code == 0
     assert not (project_dir / "AGENTS.md").exists()
     assert "Skipping instruction injection (--no-instructions)." in result.output
+    assert "Disabled by --no-instructions." in result.output
 
 
 def test_setup_skips_instructions_when_non_interactive(tmp_path: Path, monkeypatch) -> None:
@@ -140,6 +145,7 @@ def test_setup_skips_instructions_when_non_interactive(tmp_path: Path, monkeypat
     monkeypatch.chdir(project_dir)
 
     monkeypatch.setattr(cli_main, "_ensure_server_running", lambda host, port: None)
+    monkeypatch.setattr(cli_main, "_ensure_token", lambda config, name: "hoard_sk_test")
     monkeypatch.setattr(cli_main, "_is_interactive_session", lambda: False)
 
     runner = CliRunner()
@@ -148,6 +154,7 @@ def test_setup_skips_instructions_when_non_interactive(tmp_path: Path, monkeypat
     assert result.exit_code == 0
     assert not (project_dir / "AGENTS.md").exists()
     assert "Skipping instruction injection in non-interactive mode." in result.output
+    assert "Non-interactive session." in result.output
 
 
 def test_openclaw_client_script_contains_new_and_existing_commands() -> None:

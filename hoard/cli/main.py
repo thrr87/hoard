@@ -39,6 +39,13 @@ from hoard.core.onboarding import (
     detect_obsidian_vaults,
 )
 from hoard.core.search.service import search_entities
+from hoard.core.security.server_secret import (
+    ensure_server_secret,
+    require_server_secret,
+    resolve_server_secret,
+    server_secret_env_key,
+    server_secret_file_path,
+)
 from hoard.core.sync.background import BackgroundSync
 from hoard.core.sync.service import run_sync_with_lock
 from hoard.core.sync.watcher import WATCHDOG_AVAILABLE
@@ -85,9 +92,10 @@ def _call_mcp(config: dict, method: str, params: dict, *, token_override: str | 
 
 
 def _call_admin(config: dict, method: str, params: dict) -> dict:
-    admin_token = os.environ.get(config.get("write", {}).get("server_secret_env", "HOARD_SERVER_SECRET"))
-    if not admin_token:
-        raise click.ClickException("HOARD_SERVER_SECRET is required for admin commands.")
+    try:
+        admin_token = require_server_secret(config)
+    except RuntimeError as exc:
+        raise click.ClickException(str(exc)) from exc
     return _call_mcp(config, method, params, token_override=admin_token)
 
 
@@ -1142,7 +1150,8 @@ def doctor_command(config_path: Path | None) -> None:
         console.print("[yellow][!][/yellow] Vectors disabled (run 'hoard init --vectors' to enable)")
 
     tokens = config.get("security", {}).get("tokens", [])
-    if not tokens:
+    db_token_count = conn.execute("SELECT COUNT(*) FROM agent_tokens").fetchone()[0]
+    if not tokens and db_token_count == 0:
         console.print("[yellow][!][/yellow] No MCP token configured for Claude Code")
 
     inbox_cfg = config.get("connectors", {}).get("inbox", {})
@@ -1203,6 +1212,15 @@ def serve_command(
         _install_autostart(host, port)
         return
 
+    if config.get("write", {}).get("enabled", True):
+        had_secret = bool(resolve_server_secret(config))
+        try:
+            _, source = ensure_server_secret(config, generate=True)
+        except RuntimeError as exc:
+            raise click.ClickException(str(exc)) from exc
+        if not had_secret and source == "file":
+            console.print(f"Generated server secret in {server_secret_file_path(config)}")
+
     if daemon:
         _serve_daemon(host, port, no_migrate=no_migrate)
         return
@@ -1226,6 +1244,14 @@ def mcp_group() -> None:
 @click.option("--config", "config_path", type=click.Path(path_type=Path))
 def mcp_serve_command(host: str, port: int, no_migrate: bool, config_path: Path | None) -> None:
     config = load_config(config_path)
+    if config.get("write", {}).get("enabled", True):
+        had_secret = bool(resolve_server_secret(config))
+        try:
+            _, source = ensure_server_secret(config, generate=True)
+        except RuntimeError as exc:
+            raise click.ClickException(str(exc)) from exc
+        if not had_secret and source == "file":
+            console.print(f"Generated server secret in {server_secret_file_path(config)}")
     background = BackgroundSync(config=config, config_path=config_path, log=console.print)
     background.start()
     console.print(f"Starting MCP server on {host}:{port}")
@@ -1336,30 +1362,102 @@ def setup_command(
         console.print("No clients selected.")
         return
 
+    had_secret = bool(resolve_server_secret(config))
+    try:
+        _, secret_source = ensure_server_secret(config, generate=True)
+    except RuntimeError as exc:
+        raise click.ClickException(str(exc)) from exc
+    if not had_secret and secret_source == "file":
+        console.print(f"Generated server secret in {server_secret_file_path(config)}")
+
     _ensure_server_running(host, port)
     token_value = _ensure_token(config, name="default")
-    save_config(config, config_path)
 
+    client_status: dict[str, str] = {}
     if "claude" in targets:
         if project_scope:
             _configure_claude_project_scope(url)
+            client_status["Claude Code"] = "configured (project-scope)"
         else:
             _configure_claude_user_scope(url, token_value)
+            client_status["Claude Code"] = "configured (user-scope)"
     if "codex" in targets:
         _configure_codex(url)
+        client_status["Codex"] = "configured"
     if "openclaw" in targets:
         _configure_openclaw(url, token_value)
+        client_status["OpenClaw"] = "configured"
 
     if no_instructions:
         console.print("Skipping instruction injection (--no-instructions).")
+        instructions_result = {
+            "status": "skipped",
+            "detail": "Disabled by --no-instructions.",
+            "command": f"hoard instructions {_instruction_target_flags(targets)} --root {Path.cwd()}",
+        }
     else:
-        _maybe_apply_instructions_for_setup(targets)
+        instructions_result = _maybe_apply_instructions_for_setup(targets)
 
-    console.print("Setup complete.")
+    _print_setup_summary(
+        config=config,
+        host=host,
+        port=port,
+        targets=targets,
+        secret_source=secret_source,
+        token_value=token_value,
+        client_status=client_status,
+        instructions_result=instructions_result,
+    )
 
 def _check(label: str, ok: bool) -> None:
     status = "[green]✓[/green]" if ok else "[red]✗[/red]"
     console.print(f"{status} {label}")
+
+
+def _print_setup_summary(
+    *,
+    config: dict,
+    host: str,
+    port: int,
+    targets: list[str],
+    secret_source: str,
+    token_value: str,
+    client_status: dict[str, str],
+    instructions_result: dict[str, str],
+) -> None:
+    table = Table(title="Setup Summary", show_header=True)
+    table.add_column("Item")
+    table.add_column("Status")
+
+    table.add_row("Server health", "ok")
+    if secret_source == "env":
+        table.add_row("Server secret", f"env ({server_secret_env_key(config)})")
+    else:
+        table.add_row("Server secret", f"file ({server_secret_file_path(config)})")
+    table.add_row("Token provisioning", "registered default agent token")
+
+    for name in ["Claude Code", "Codex", "OpenClaw"]:
+        status = client_status.get(name)
+        if status:
+            table.add_row(name, status)
+        elif name.lower().split()[0] in targets:
+            table.add_row(name, "configured")
+    table.add_row("Instructions", f"{instructions_result.get('status', 'unknown')}: {instructions_result.get('detail', '')}")
+
+    console.print(table)
+
+    command = instructions_result.get("command")
+    if command:
+        console.print(f"Instruction fix: {command}")
+
+    if "codex" in targets:
+        console.print("\nCodex token setup:")
+        console.print(f'  export HOARD_TOKEN="{token_value}"')
+
+    console.print("\nNext steps:")
+    console.print(f"  1. Verify setup: hoard setup --verify")
+    console.print(f"  2. Confirm server: http://{host}:{port}/mcp")
+    console.print("  3. Restart your AI tools to load updated MCP config")
 
 
 def _fts_present(conn) -> bool:
@@ -1674,23 +1772,25 @@ def _is_interactive_session() -> bool:
     return bool(sys.stdin.isatty())
 
 
-def _maybe_apply_instructions_for_setup(setup_targets: List[str]) -> None:
+def _maybe_apply_instructions_for_setup(setup_targets: List[str]) -> dict[str, str]:
     instruction_targets = [target for target in setup_targets if target in {"claude", "codex", "openclaw"}]
     if not instruction_targets:
-        return
+        return {"status": "skipped", "detail": "No instruction-capable clients selected.", "command": ""}
 
     if not _is_interactive_session():
         flags = _instruction_target_flags(instruction_targets)
         console.print("Skipping instruction injection in non-interactive mode.")
-        console.print(f"Run: hoard instructions {flags} --root {Path.cwd()}")
-        return
+        command = f"hoard instructions {flags} --root {Path.cwd()}"
+        console.print(f"Run: {command}")
+        return {"status": "skipped", "detail": "Non-interactive session.", "command": command}
 
     root = resolve_project_root(Path.cwd()) if any(t in {"claude", "codex"} for t in instruction_targets) else None
     if any(t in {"claude", "codex"} for t in instruction_targets) and root is None:
         flags = _instruction_target_flags(instruction_targets)
         console.print("Could not determine a project root for instruction injection.")
-        console.print(f"Run: hoard instructions {flags} --root {Path.cwd()}")
-        return
+        command = f"hoard instructions {flags} --root {Path.cwd()}"
+        console.print(f"Run: {command}")
+        return {"status": "skipped", "detail": "Project root not detected.", "command": command}
 
     plans = compute_targets(root, instruction_targets)
     block = render_instruction_block(_instruction_docs_url())
@@ -1703,49 +1803,36 @@ def _maybe_apply_instructions_for_setup(setup_targets: List[str]) -> None:
 
     if not any(change.changed for change in changes):
         console.print("Instruction files already up to date.")
-        return
+        return {"status": "up-to-date", "detail": "Instruction files already up to date.", "command": ""}
 
     _print_instruction_plan(changes)
     if not click.confirm("Apply Hoard instruction updates to these files?", default=True):
         console.print("Instruction update canceled.")
-        return
+        flags = _instruction_target_flags(instruction_targets)
+        command = f"hoard instructions {flags} --root {Path.cwd()}"
+        return {"status": "skipped", "detail": "User canceled instruction update.", "command": command}
 
     result = apply_change_plan(changes)
     console.print(f"Instruction update complete. Changed {len(result.applied)} file(s).")
+    return {"status": "applied", "detail": f"Changed {len(result.applied)} file(s).", "command": ""}
 
 
 def _ensure_token(config: dict, name: str) -> str:
-    env_key = config.get("write", {}).get("server_secret_env", "HOARD_SERVER_SECRET")
-    if env_key and os.environ.get(env_key):
-        result = _call_admin(
-            config,
-            "tools/call",
-            {
-                "name": "agent_register",
-                "arguments": {
-                    "agent_id": name,
-                    "scopes": ["search", "get", "memory", "sync", "ingest"],
-                    "overwrite": True,
-                },
-            },
-        )
-        token_value = result.get("token")
-        if not token_value:
-            raise click.ClickException("Failed to provision token.")
-        return token_value
-
-    tokens = config.setdefault("security", {}).setdefault("tokens", [])
-    for token in tokens:
-        if token.get("name") == name:
-            return token.get("token")
-    token_value = f"hoard_sk_{secrets.token_hex(16)}"
-    tokens.append(
+    result = _call_admin(
+        config,
+        "tools/call",
         {
-            "name": name,
-            "token": token_value,
-            "scopes": ["search", "get", "memory", "sync", "ingest"],
-        }
+            "name": "agent_register",
+            "arguments": {
+                "agent_id": name,
+                "scopes": ["search", "get", "memory", "sync", "ingest"],
+                "overwrite": True,
+            },
+        },
     )
+    token_value = result.get("token")
+    if not token_value:
+        raise click.ClickException("Failed to provision token.")
     return token_value
 
 
@@ -1757,6 +1844,12 @@ def _ensure_server_running(host: str, port: int) -> None:
         if _is_server_healthy(host, port):
             return
         time.sleep(0.5)
+    _, log_path = _daemon_paths()
+    raise click.ClickException(
+        "Hoard server failed to start.\n"
+        f"Check logs: {log_path}\n"
+        "Ensure the server secret is configured and retry `hoard setup --verify`."
+    )
 
 
 def _is_server_healthy(host: str, port: int) -> bool:
@@ -2070,19 +2163,45 @@ def _verify_setup() -> None:
     host = config.get("server", {}).get("host", "127.0.0.1")
     port = int(config.get("server", {}).get("port", 19850))
     token = os.environ.get("HOARD_TOKEN")
+    secret = resolve_server_secret(config)
+    secret_path = server_secret_file_path(config)
+    env_key = server_secret_env_key(config)
 
     console.print("\nTier 1: Hoard Server Health")
+    if secret:
+        source = f"env ({env_key})" if os.environ.get(env_key) else f"file ({secret_path})"
+        console.print(f"  [green]✓[/green] Server secret available: {source}")
+    else:
+        console.print(
+            "  [red]✗[/red] Server secret missing.\n"
+            f"      Set {env_key} or create {secret_path}."
+        )
+
     if _is_server_healthy(host, port):
         console.print(f"  [green]✓[/green] Server responding: http://{host}:{port}")
     else:
         console.print(f"  [red]✗[/red] Server not responding: http://{host}:{port}")
         return
 
+    if secret:
+        if _check_tools_list(host, port, secret):
+            console.print("  [green]✓[/green] Tools available (admin token)")
+        else:
+            console.print("  [red]✗[/red] Tools list failed (admin token)")
+
+        write_ok, detail = _check_write_smoke(host, port, secret)
+        if write_ok:
+            console.print("  [green]✓[/green] Write tools operational")
+        else:
+            console.print(f"  [red]✗[/red] Write smoke test failed: {detail}")
+    else:
+        console.print("  [yellow]![/yellow] Skipping write smoke check (no server secret)")
+
     if token:
         if _check_tools_list(host, port, token):
-            console.print("  [green]✓[/green] Tools available")
+            console.print("  [green]✓[/green] HOARD_TOKEN tools check passed")
         else:
-            console.print("  [red]✗[/red] Tools list failed")
+            console.print("  [yellow]![/yellow] HOARD_TOKEN tools check failed")
     else:
         console.print("  [yellow]![/yellow] HOARD_TOKEN not set; skipping tools check")
 
@@ -2103,21 +2222,79 @@ def _check_file(path: Path, label: str) -> None:
 
 
 def _check_tools_list(host: str, port: int, token: str) -> bool:
+    response = _mcp_jsonrpc(host, port, token, "tools/list", {})
+    return isinstance(response, dict) and "result" in response and "error" not in response
+
+
+def _check_write_smoke(host: str, port: int, token: str) -> tuple[bool, str]:
+    write_resp = _mcp_jsonrpc(
+        host,
+        port,
+        token,
+        "tools/call",
+        {
+            "name": "memory_write",
+            "arguments": {
+                "content": "setup verify smoke",
+                "memory_type": "event",
+                "scope_type": "user",
+                "source_context": "setup.verify",
+                "sensitivity": "normal",
+                "tags": ["setup", "verify"],
+            },
+        },
+    )
+    if not isinstance(write_resp, dict):
+        return False, "invalid response"
+    if write_resp.get("error"):
+        return False, write_resp["error"].get("message", "unknown error")
+
+    try:
+        memory_payload = json.loads(write_resp["result"]["content"][0]["text"])
+        memory_id = memory_payload["memory"]["id"]
+    except Exception:
+        return False, "unable to parse memory_write response"
+
+    retract_resp = _mcp_jsonrpc(
+        host,
+        port,
+        token,
+        "tools/call",
+        {
+            "name": "memory_retract",
+            "arguments": {
+                "id": memory_id,
+                "reason": "setup verify smoke cleanup",
+            },
+        },
+    )
+    if not isinstance(retract_resp, dict):
+        return False, "invalid retract response"
+    if retract_resp.get("error"):
+        return False, retract_resp["error"].get("message", "unknown retract error")
+    return True, ""
+
+
+def _mcp_jsonrpc(host: str, port: int, token: str, method: str, params: dict) -> dict:
     import urllib.error
     import urllib.request
 
     try:
         req = urllib.request.Request(
             f"http://{host}:{port}/mcp",
-            data=json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}).encode(),
+            data=json.dumps({"jsonrpc": "2.0", "id": 1, "method": method, "params": params}).encode(),
             headers={"Content-Type": "application/json", "Authorization": f"Bearer {token}"},
         )
         with urllib.request.urlopen(req, timeout=5) as resp:
-            return resp.status == 200
-    except urllib.error.HTTPError:
-        return False
+            return json.loads(resp.read())
+    except urllib.error.HTTPError as exc:
+        try:
+            payload = json.loads(exc.read())
+        except Exception:
+            payload = {"error": {"message": str(exc)}}
+        return payload
     except Exception:
-        return False
+        return {"error": {"message": "request failed"}}
 
 
 def _uninstall_integration(client: str) -> None:

@@ -1,11 +1,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-import os
 from typing import Iterable, List, Optional, Set
 
 from hoard.core.security.agent_tokens import authenticate_agent
 from hoard.core.security.errors import AuthError, ScopeError
+from hoard.core.security.server_secret import resolve_server_secret
 
 
 @dataclass(frozen=True)
@@ -50,19 +50,22 @@ def load_tokens(config: dict) -> List[TokenInfo]:
 
 def authenticate_token(token_value: str, config: dict, conn=None) -> TokenInfo:
     if conn is not None and _server_secret_available(config):
-        agent = authenticate_agent(conn, token_value, config)
-        return TokenInfo(
-            name=agent.agent_id,
-            token=None,
-            scopes=agent.scopes,
-            capabilities=agent.capabilities,
-            trust_level=agent.trust_level,
-            can_access_sensitive=agent.can_access_sensitive,
-            can_access_restricted=agent.can_access_restricted,
-            requires_user_confirm=agent.requires_user_confirm,
-            proposal_ttl_days=agent.proposal_ttl_days,
-            rate_limit_per_hour=agent.rate_limit_per_hour,
-        )
+        try:
+            agent = authenticate_agent(conn, token_value, config)
+            return TokenInfo(
+                name=agent.agent_id,
+                token=None,
+                scopes=agent.scopes,
+                capabilities=agent.capabilities,
+                trust_level=agent.trust_level,
+                can_access_sensitive=agent.can_access_sensitive,
+                can_access_restricted=agent.can_access_restricted,
+                requires_user_confirm=agent.requires_user_confirm,
+                proposal_ttl_days=agent.proposal_ttl_days,
+                rate_limit_per_hour=agent.rate_limit_per_hour,
+            )
+        except AuthError:
+            pass
 
     for token in load_tokens(config):
         if token.token == token_value:
@@ -71,8 +74,7 @@ def authenticate_token(token_value: str, config: dict, conn=None) -> TokenInfo:
 
 
 def _server_secret_available(config: dict) -> bool:
-    env_key = config.get("write", {}).get("server_secret_env", "HOARD_SERVER_SECRET")
-    return bool(env_key and os.environ.get(env_key))
+    return bool(resolve_server_secret(config))
 
 
 def require_scopes(token: TokenInfo, required: Iterable[str]) -> None:

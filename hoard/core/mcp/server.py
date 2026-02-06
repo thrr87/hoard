@@ -22,6 +22,7 @@ from hoard.core.security.audit import log_access
 from hoard.core.security.auth import TokenInfo, authenticate_token
 from hoard.core.security.errors import AuthError, ScopeError
 from hoard.core.security.limits import RateLimitError, RateLimiter
+from hoard.core.security.server_secret import require_server_secret, resolve_server_secret
 from hoard.core.worker import Worker
 
 SUPPORTED_PROTOCOL_VERSIONS = ["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"]
@@ -213,8 +214,7 @@ class MCPRequestHandler(BaseHTTPRequestHandler):
         if not header.startswith("Bearer "):
             raise AuthError("Missing bearer token")
         token_value = header.split(" ", 1)[1]
-        env_key = self.server.config.get("write", {}).get("server_secret_env", "HOARD_SERVER_SECRET")
-        server_secret = os.environ.get(env_key)
+        server_secret = resolve_server_secret(self.server.config)
         if server_secret and token_value == server_secret:
             return TokenInfo(
                 name="admin",
@@ -344,11 +344,7 @@ def _negotiate_version(requested: str | None) -> str:
 def _require_server_secret(config: dict) -> None:
     if not config.get("write", {}).get("enabled", True):
         return
-    env_key = config.get("write", {}).get("server_secret_env", "HOARD_SERVER_SECRET")
-    if not env_key:
-        raise RuntimeError("write.server_secret_env is not configured")
-    if not os.environ.get(env_key):
-        raise RuntimeError(f"{env_key} environment variable not set")
+    require_server_secret(config)
 
 
 def _bootstrap_tokens(conn, config: dict) -> None:
