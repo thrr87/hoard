@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import os
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict
@@ -301,14 +302,27 @@ def ensure_config_file(path: Path | None = None) -> Path:
     if not config_path.exists():
         base = copy.deepcopy(DEFAULT_CONFIG)
         config = _apply_data_dir_defaults(base, {})
-        config_path.write_text(yaml.safe_dump(config, sort_keys=False))
+        save_config(config, config_path)
     return config_path
 
 
 def save_config(config: Dict[str, Any], path: Path | None = None) -> Path:
     config_path = path or get_default_config_path()
     config_path.parent.mkdir(parents=True, exist_ok=True)
-    config_path.write_text(yaml.safe_dump(config, sort_keys=False))
+    data = yaml.safe_dump(config, sort_keys=False)
+    fd, tmp = tempfile.mkstemp(dir=config_path.parent, suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, config_path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
     return config_path
 
 
