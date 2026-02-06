@@ -23,6 +23,10 @@ def _call_mcp(url: str, token: str | None, method: str, params: dict) -> tuple[i
         return resp.status, json.loads(resp.read())
 
 
+def _base_url(mcp_url: str) -> str:
+    return mcp_url.replace("/mcp", "")
+
+
 def test_http_mcp_tools_list_and_search(tmp_path: Path, mcp_server) -> None:
     data_dir = tmp_path / "data"
     data_dir.mkdir()
@@ -207,3 +211,41 @@ def test_http_mcp_inbox_put_and_sync(tmp_path: Path, mcp_server) -> None:
             os.environ.pop("HOME", None)
         else:
             os.environ["HOME"] = original_home
+
+
+def test_http_health_endpoint_no_auth(tmp_path: Path, mcp_server) -> None:
+    db_path = tmp_path / "hoard.db"
+    config_path = tmp_path / "config.yaml"
+    save_config({"storage": {"db_path": str(db_path)}}, config_path)
+
+    mcp_url = mcp_server(config_path)
+    req = urllib.request.Request(f"{_base_url(mcp_url)}/health", method="GET")
+    with urllib.request.urlopen(req, timeout=5) as resp:
+        payload = json.loads(resp.read())
+        assert resp.status == 200
+        assert payload["service"] == "hoard"
+        assert payload["db_ready"] is True
+        assert payload["migrations_pending"] is False
+        assert payload["status"] == "ok"
+
+
+def test_http_health_endpoint_reports_pending_migrations(tmp_path: Path, mcp_server, monkeypatch) -> None:
+    import hoard.core.mcp.server as mcp_server_module
+
+    db_path = tmp_path / "hoard.db"
+    config_path = tmp_path / "config.yaml"
+    save_config({"storage": {"db_path": str(db_path)}}, config_path)
+
+    monkeypatch.setattr(mcp_server_module, "get_current_version", lambda conn: 1)
+    monkeypatch.setattr(mcp_server_module, "get_migrations", lambda: {1: object(), 2: object()})
+
+    mcp_url = mcp_server(config_path)
+    req = urllib.request.Request(f"{_base_url(mcp_url)}/health", method="GET")
+    try:
+        urllib.request.urlopen(req, timeout=5)
+    except urllib.error.HTTPError as exc:
+        assert exc.code == 503
+        payload = json.loads(exc.read())
+        assert payload["db_ready"] is True
+        assert payload["migrations_pending"] is True
+        assert payload["status"] == "degraded"

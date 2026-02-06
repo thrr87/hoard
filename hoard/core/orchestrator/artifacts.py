@@ -7,6 +7,7 @@ import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from hoard.core.config import default_data_path
 from hoard.core.orchestrator.utils import dumps, now_iso
 
 
@@ -35,9 +36,8 @@ def artifact_put(
     if not artifact_type:
         raise ArtifactError("artifact_type is required")
 
-    blob_root = Path(
-        config.get("artifacts", {}).get("blob_path", str(Path.home() / ".hoard" / "artifacts"))
-    ).expanduser()
+    blob_root_value = config.get("artifacts", {}).get("blob_path")
+    blob_root = Path(blob_root_value).expanduser() if blob_root_value else default_data_path("artifacts")
     inline_max = int(config.get("artifacts", {}).get("inline_max_bytes", 262_144))
 
     content_bytes: bytes | None = None

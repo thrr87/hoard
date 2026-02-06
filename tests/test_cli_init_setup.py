@@ -79,7 +79,7 @@ def test_cli_setup_fails_when_server_unhealthy(tmp_path: Path, monkeypatch) -> N
     home_dir.mkdir()
     monkeypatch.setenv("HOME", str(home_dir))
 
-    monkeypatch.setattr(cli_main, "_serve_daemon", lambda host, port, no_migrate=False: None)
+    monkeypatch.setattr(cli_main, "_serve_daemon", lambda host, port, no_migrate=False, allow_remote=False: None)
     monkeypatch.setattr(cli_main, "_is_server_healthy", lambda host, port: False)
 
     runner = CliRunner()
@@ -108,3 +108,69 @@ def test_cli_setup_verify_output(tmp_path: Path, monkeypatch) -> None:
     assert "Tier 1" in result.output
     assert "Tier 2" in result.output
     assert "Write tools operational" in result.output
+
+
+def test_cli_serve_blocks_remote_bind_without_opt_in(tmp_path: Path, monkeypatch) -> None:
+    home_dir = tmp_path / "home"
+    home_dir.mkdir()
+    monkeypatch.setenv("HOME", str(home_dir))
+
+    runner = CliRunner()
+    result = runner.invoke(cli, ["serve", "--host", "0.0.0.0", "--daemon"])
+    assert result.exit_code != 0
+    assert "Refusing non-loopback bind" in result.output
+
+
+def test_cli_serve_allows_remote_bind_with_flag(tmp_path: Path, monkeypatch) -> None:
+    home_dir = tmp_path / "home"
+    home_dir.mkdir()
+    monkeypatch.setenv("HOME", str(home_dir))
+
+    called: dict[str, object] = {}
+
+    def _fake_daemon(host: str, port: int, no_migrate: bool = False, allow_remote: bool = False) -> None:
+        called["host"] = host
+        called["port"] = port
+        called["allow_remote"] = allow_remote
+
+    monkeypatch.setattr(cli_main, "_serve_daemon", _fake_daemon)
+
+    runner = CliRunner()
+    result = runner.invoke(cli, ["serve", "--host", "0.0.0.0", "--daemon", "--allow-remote"])
+    assert result.exit_code == 0
+    assert called["host"] == "0.0.0.0"
+    assert called["allow_remote"] is True
+
+
+def test_cli_serve_allows_remote_bind_via_config(tmp_path: Path, monkeypatch) -> None:
+    home_dir = tmp_path / "home"
+    home_dir.mkdir()
+    monkeypatch.setenv("HOME", str(home_dir))
+
+    config_path = home_dir / ".hoard" / "config.yaml"
+    save_config({"server": {"allow_remote": True}}, config_path)
+
+    called = {"count": 0}
+
+    def _fake_daemon(host: str, port: int, no_migrate: bool = False, allow_remote: bool = False) -> None:
+        called["count"] += 1
+        called["allow_remote"] = allow_remote
+
+    monkeypatch.setattr(cli_main, "_serve_daemon", _fake_daemon)
+
+    runner = CliRunner()
+    result = runner.invoke(cli, ["serve", "--host", "0.0.0.0", "--daemon"])
+    assert result.exit_code == 0
+    assert called["count"] == 1
+    assert called["allow_remote"] is True
+
+
+def test_cli_mcp_serve_blocks_remote_bind_without_opt_in(tmp_path: Path, monkeypatch) -> None:
+    home_dir = tmp_path / "home"
+    home_dir.mkdir()
+    monkeypatch.setenv("HOME", str(home_dir))
+
+    runner = CliRunner()
+    result = runner.invoke(cli, ["mcp", "serve", "--host", "0.0.0.0", "--no-migrate"])
+    assert result.exit_code != 0
+    assert "Refusing non-loopback bind" in result.output

@@ -4,6 +4,7 @@ import json
 import os
 import time
 import urllib.parse
+from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Dict
@@ -41,6 +42,9 @@ class MCPRequestHandler(BaseHTTPRequestHandler):
             self._write_json(500, {"error": str(exc)})
 
     def do_GET(self) -> None:  # noqa: N802
+        if self.path == "/health":
+            self._handle_health()
+            return
         if self.path == "/sync_status":
             self._handle_custom_http()
             return
@@ -48,6 +52,42 @@ class MCPRequestHandler(BaseHTTPRequestHandler):
             self._handle_events()
             return
         self._write_json(404, {"error": "Not found"})
+
+    def _handle_health(self) -> None:
+        payload = {
+            "service": "hoard",
+            "version": __version__,
+            "time": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "status": "degraded",
+            "db_ready": False,
+            "schema_current": None,
+            "schema_latest": None,
+            "migrations_pending": True,
+        }
+        status = 503
+
+        conn = None
+        try:
+            conn = connect(self.server.db_path)
+            payload["db_ready"] = True
+            current = get_current_version(conn)
+            migrations = get_migrations()
+            latest = max(migrations.keys()) if migrations else 0
+            pending = current < latest
+
+            payload["schema_current"] = current
+            payload["schema_latest"] = latest
+            payload["migrations_pending"] = pending
+            payload["status"] = "ok" if not pending else "degraded"
+            status = 200 if not pending else 503
+        except Exception:
+            payload["status"] = "degraded"
+            status = 503
+        finally:
+            if conn is not None:
+                conn.close()
+
+        self._write_json(status, payload)
 
     def _handle_custom_http(self) -> None:
         length = int(self.headers.get("Content-Length", "0"))
