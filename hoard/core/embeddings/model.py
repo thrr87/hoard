@@ -2,8 +2,10 @@ from __future__ import annotations
 
 from typing import List
 
+from hoard.core.errors import HoardError
 
-class EmbeddingError(Exception):
+
+class EmbeddingError(HoardError):
     pass
 
 

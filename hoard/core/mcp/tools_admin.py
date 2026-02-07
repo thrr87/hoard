@@ -1,10 +1,10 @@
 from __future__ import annotations
 
-from typing import Any, Dict, List
 import secrets
+from typing import Any, Dict, List
 
+from hoard.core.mcp.scopes import require_any_scope
 from hoard.core.security.agent_tokens import delete_agent, list_agents, register_agent
-from hoard.core.security.errors import ScopeError
 
 
 TOOL_DEFINITIONS: List[Dict[str, Any]] = [
@@ -97,6 +97,4 @@ def dispatch_tool(tool: str, arguments: Dict[str, Any], conn, config: Dict[str, 
 
 
 def _require_admin(token) -> None:
-    if "admin" in token.scopes:
-        return
-    raise ScopeError("Missing scopes: admin")
+    require_any_scope(token, {"admin"}, message="Missing scopes: admin")

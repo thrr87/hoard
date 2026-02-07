@@ -1,11 +1,12 @@
 from __future__ import annotations
 
+import logging
 import os
 import socket
 import threading
 import time
 import uuid
-from datetime import datetime, timedelta
+from datetime import timedelta
 from typing import Optional
 
 from hoard.core.db.connection import connect
@@ -13,6 +14,13 @@ from hoard.core.db.writer import WriteCoordinator
 from hoard.core.memory.embeddings import encode_embedding
 from hoard.core.memory.model_cache import get_sentence_transformer
 from hoard.core.memory.predicates import active_memory_conditions
+from hoard.core.time import utc_now_naive, utc_now_naive_iso
+
+LOGGER = logging.getLogger(__name__)
+
+
+def _now_iso() -> str:
+    return utc_now_naive_iso(timespec="seconds")
 
 
 class Worker:
@@ -38,12 +46,7 @@ class Worker:
         lease_seconds = int(self._config.get("write", {}).get("worker", {}).get("lease_duration_seconds", 60))
 
         while not self._stop.is_set():
-            if not self._writer.submit(self._acquire_or_renew_lease, lease_seconds):
-                time.sleep(poll_interval)
-                continue
-
-            self._writer.submit(self._requeue_stuck_jobs, job_timeout)
-            job = self._writer.submit(self._claim_job)
+            job = self._writer.submit(self._acquire_lease_and_claim_job, lease_seconds, job_timeout)
             if not job:
                 time.sleep(poll_interval)
                 continue
@@ -61,6 +64,7 @@ class Worker:
                 elif job_type == "detect_conflicts":
                     self._process_conflicts(memory_id)
             except Exception as exc:
+                LOGGER.exception("Worker job failed: %s", job_type)
                 error = str(exc)
 
             if error:
@@ -68,11 +72,17 @@ class Worker:
             else:
                 self._writer.submit(self._complete_job, job_id)
 
+    def _acquire_lease_and_claim_job(self, conn, lease_seconds: int, job_timeout: int) -> Optional[dict]:
+        if not self._acquire_or_renew_lease(conn, lease_seconds):
+            return None
+        self._requeue_stuck_jobs(conn, job_timeout)
+        return self._claim_job(conn)
+
     def _acquire_or_renew_lease(self, conn, lease_seconds: int) -> bool:
         if not self._worker_id:
             self._worker_id = f"worker-{socket.gethostname()}-{os.getpid()}-{id(self)}"
-        now = datetime.utcnow().isoformat(timespec="seconds")
-        expires_at = (datetime.utcnow() + timedelta(seconds=lease_seconds)).isoformat(timespec="seconds")
+        now = _now_iso()
+        expires_at = (utc_now_naive() + timedelta(seconds=lease_seconds)).isoformat(timespec="seconds")
         cursor = conn.execute(
             """
             INSERT INTO worker_lease (id, worker_id, hostname, pid, acquired_at, heartbeat_at, expires_at)
@@ -108,7 +118,7 @@ class Worker:
         return True
 
     def _requeue_stuck_jobs(self, conn, timeout_seconds: int) -> None:
-        threshold = (datetime.utcnow() - timedelta(seconds=timeout_seconds)).isoformat(timespec="seconds")
+        threshold = (utc_now_naive() - timedelta(seconds=timeout_seconds)).isoformat(timespec="seconds")
         rows = conn.execute(
             """
             SELECT id, retry_count, max_retries
@@ -125,7 +135,7 @@ class Worker:
                     SET status = 'failed', completed_at = ?, error = 'Job timed out'
                     WHERE id = ?
                     """,
-                    (datetime.utcnow().isoformat(timespec="seconds"), row["id"]),
+                    (_now_iso(), row["id"]),
                 )
             else:
                 conn.execute(
@@ -155,7 +165,7 @@ class Worker:
             SET status = 'running', started_at = ?
             WHERE id = ?
             """,
-            (datetime.utcnow().isoformat(timespec="seconds"), job_id),
+            (_now_iso(), job_id),
         )
         job = conn.execute("SELECT * FROM background_jobs WHERE id = ?", (job_id,)).fetchone()
         return dict(job) if job else None
@@ -167,7 +177,7 @@ class Worker:
             SET status = 'completed', completed_at = ?
             WHERE id = ?
             """,
-            (datetime.utcnow().isoformat(timespec="seconds"), job_id),
+            (_now_iso(), job_id),
         )
 
     def _fail_job(self, conn, job_id: str, error: str) -> None:
@@ -177,7 +187,7 @@ class Worker:
             SET status = 'failed', completed_at = ?, error = ?
             WHERE id = ?
             """,
-            (datetime.utcnow().isoformat(timespec="seconds"), error, job_id),
+            (_now_iso(), error, job_id),
         )
 
     def _process_embed(self, memory_id: str) -> None:
@@ -198,7 +208,7 @@ class Worker:
         model = get_sentence_transformer(model_name)
         vector = model.encode([content], normalize_embeddings=True)[0]
         blob = encode_embedding(vector, dimensions)
-        embedded_at = datetime.utcnow().isoformat(timespec="seconds")
+        embedded_at = _now_iso()
 
         def _store(conn):
             conn.execute(
@@ -264,7 +274,7 @@ class Worker:
                 return
             query_vec = list(query_arr)
 
-            now = datetime.utcnow().isoformat(timespec="seconds")
+            now = _now_iso()
             src_conditions, src_params = active_memory_conditions(now, table_alias="m")
             src_conditions.append("m.id = ?")
             src_params.append(memory_id)
@@ -288,6 +298,21 @@ class Worker:
                 conditions.append("m.scope_id = ?")
                 params.append(mem_row["scope_id"])
 
+            lookback_days = int(
+                self._config.get("write", {}).get("duplicates", {}).get("candidate_lookback_days", 90)
+            )
+            if lookback_days > 0:
+                created_after = (utc_now_naive() - timedelta(days=lookback_days)).isoformat(
+                    timespec="seconds"
+                )
+                conditions.append("m.created_at >= ?")
+                params.append(created_after)
+
+            max_candidates = int(
+                self._config.get("write", {}).get("duplicates", {}).get("max_candidates", 2000)
+            )
+            if max_candidates <= 0:
+                max_candidates = 2000
             where_clause = " AND ".join(conditions)
             candidates = conn.execute(
                 f"""
@@ -295,8 +320,10 @@ class Worker:
                 FROM memory_embeddings e
                 JOIN memories m ON m.id = e.memory_id
                 WHERE {where_clause}
+                ORDER BY m.created_at DESC
+                LIMIT ?
                 """,
-                params,
+                [*params, max_candidates],
             ).fetchall()
 
             duplicates = []
@@ -331,7 +358,7 @@ class Worker:
                 if already:
                     continue
                 dup_id = str(uuid.uuid4())
-                now_ts = datetime.utcnow().isoformat(timespec="seconds")
+                now_ts = _now_iso()
                 conn.execute(
                     "INSERT INTO memory_duplicates (id, detected_at, similarity) VALUES (?, ?, ?)",
                     (dup_id, now_ts, similarity),
@@ -350,7 +377,7 @@ class Worker:
     def _process_conflicts(self, memory_id: str) -> None:
         conn = connect(self._db_path)
         try:
-            now = datetime.utcnow().isoformat(timespec="seconds")
+            now = _now_iso()
             src_conditions, src_params = active_memory_conditions(now, table_alias="m")
             src_conditions.append("m.id = ?")
             src_params.append(memory_id)
@@ -366,7 +393,7 @@ class Worker:
             scope_type = mem_row["scope_type"]
             scope_id = mem_row["scope_id"]
 
-            now = datetime.utcnow().isoformat(timespec="seconds")
+            now = _now_iso()
             conditions, params = active_memory_conditions(now)
             conditions.append("m.id != ?")
             params.append(memory_id)
@@ -409,7 +436,7 @@ class Worker:
             conn.close()
 
         def _store_conflict(conn):
-            now_ts = datetime.utcnow().isoformat(timespec="seconds")
+            now_ts = _now_iso()
             if existing_conflict_id:
                 already = conn.execute(
                     "SELECT 1 FROM conflict_members WHERE conflict_id = ? AND memory_id = ?",

@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+from hoard.core.errors import HoardError
 
-class AuthError(Exception):
+
+class AuthError(HoardError):
     pass
 
 
-class ScopeError(Exception):
+class ScopeError(HoardError):
     pass

@@ -66,8 +66,11 @@ def test_stdio_tools_list_and_search(tmp_path: Path) -> None:
         {"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}}
     )
     assert tools_resp
-    tool_names = {tool["name"] for tool in tools_resp["result"]["tools"]}
+    tool_map = {tool["name"]: tool for tool in tools_resp["result"]["tools"]}
+    tool_names = set(tool_map)
     assert "search" in tool_names
+    assert "data.search" in tool_names
+    assert "token" in tool_map["data.search"]["inputSchema"]["properties"]
 
     search_resp = server._handle_single_message(
         {
@@ -75,7 +78,7 @@ def test_stdio_tools_list_and_search(tmp_path: Path) -> None:
             "id": 3,
             "method": "tools/call",
             "params": {
-                "name": "search",
+                "name": "data.search",
                 "arguments": {"query": "Hoard", "limit": 1, "token": "hoard_sk_test"},
             },
         }

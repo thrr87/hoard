@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime
+import sqlite3
 from typing import Iterable, List, Optional
 
 from hoard.core.db.connection import executemany
 from hoard.core.ingest.hash import compute_content_hash
+from hoard.core.time import utc_now_naive_iso
 from hoard.sdk.types import ChunkInput, EntityInput
 
 
@@ -14,7 +15,7 @@ def build_entity_id(source: str, source_id: str) -> str:
 
 
 def _now_iso() -> str:
-    return datetime.utcnow().isoformat(timespec="seconds")
+    return utc_now_naive_iso(timespec="seconds")
 
 
 def get_entity_by_source(conn, source: str, source_id: str) -> Optional[dict]:
@@ -116,6 +117,7 @@ def replace_chunks(conn, entity_id: str, chunks: List[ChunkInput]) -> int:
         """,
         rows,
     )
+    _mark_ann_stale(conn)
     return len(rows)
 
 
@@ -146,4 +148,18 @@ def tombstone_missing(conn, source: str, seen_source_ids: Iterable[str]) -> int:
         (now, source),
     )
     conn.execute("DROP TABLE IF EXISTS _hoard_seen_source_ids")
+    _mark_ann_stale(conn)
     return cursor.rowcount
+
+
+def _mark_ann_stale(conn) -> None:
+    try:
+        conn.execute(
+            """
+            UPDATE ann_index_meta
+            SET state = 'stale', updated_at = datetime('now')
+            WHERE id = 1
+            """
+        )
+    except sqlite3.OperationalError:
+        return

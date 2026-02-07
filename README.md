@@ -222,6 +222,8 @@ For production remote hosting (Docker + Caddy TLS), see `docs/REMOTE_DEPLOYMENT.
 ### Diagnostics
 ```bash
 hoard doctor
+hoard db backup /path/to/backup.db
+hoard db restore /path/to/backup.db --force
 ```
 
 ---
@@ -250,6 +252,21 @@ hoard serve
 ### Stdio (for MCP clients that require it)
 ```bash
 hoard mcp stdio
+```
+
+By default, stdio mode blocks write tools. Enable explicitly in config:
+
+```yaml
+mcp:
+  stdio:
+    allow_writes: true
+```
+
+HTTP exposes a lightweight metrics endpoint at `/metrics` when enabled:
+
+```yaml
+observability:
+  metrics_enabled: true
 ```
 
 ---

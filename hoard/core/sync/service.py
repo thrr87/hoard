@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import os
 import tempfile
-import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -13,6 +12,10 @@ from hoard.core.ingest.registry import iter_enabled_connectors
 from hoard.core.ingest.sync import sync_connector_with_submit
 from hoard.core.memory.store import memory_prune
 from hoard.core.models import SyncStats
+from hoard.core.sync.lock import SyncFileLock
+
+
+_GLOBAL_SYNC_LOCK: SyncFileLock | None = None
 
 
 def sync_connectors(
@@ -111,20 +114,32 @@ def _sync_with_lock_submit(
     lock_path: Optional[Path] = None,
 ) -> Dict[str, Any]:
     lock_path = lock_path or _lock_path()
-    if not _acquire_lock(lock_path):
+    lock = _acquire_lock(lock_path)
+    if lock is None:
         return {"skipped": True, "reason": "lock"}
     try:
         return sync_connectors(config, write_submit, source=source)
     finally:
-        _release_lock(lock_path)
+        _release_lock(lock)
 
 
 def acquire_sync_lock() -> bool:
-    return _acquire_lock(_lock_path())
+    global _GLOBAL_SYNC_LOCK
+    if _GLOBAL_SYNC_LOCK is not None:
+        return True
+    lock = _acquire_lock(_lock_path())
+    if lock is None:
+        return False
+    _GLOBAL_SYNC_LOCK = lock
+    return True
 
 
 def release_sync_lock() -> None:
-    _release_lock(_lock_path())
+    global _GLOBAL_SYNC_LOCK
+    if _GLOBAL_SYNC_LOCK is None:
+        return
+    _release_lock(_GLOBAL_SYNC_LOCK)
+    _GLOBAL_SYNC_LOCK = None
 
 
 def _stats_to_dict(stats: SyncStats) -> Dict[str, Any]:
@@ -153,47 +168,12 @@ def _lock_path() -> Path:
     return base / "sync.lock"
 
 
-def _acquire_lock(path: Path) -> bool:
-    try:
-        fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-    except FileExistsError:
-        if _lock_is_stale(path):
-            try:
-                path.unlink()
-            except Exception:
-                return False
-            return _acquire_lock(path)
-        return False
-
-    with os.fdopen(fd, "w") as handle:
-        handle.write(f"{os.getpid()}\n{int(time.time())}\n")
-    return True
+def _acquire_lock(path: Path) -> SyncFileLock | None:
+    lock = SyncFileLock(path)
+    if not lock.acquire(blocking=False):
+        return None
+    return lock
 
 
-def _release_lock(path: Path) -> None:
-    try:
-        path.unlink()
-    except FileNotFoundError:
-        return
-    except Exception:
-        return
-
-
-def _lock_is_stale(path: Path) -> bool:
-    try:
-        content = path.read_text().splitlines()
-        pid = int(content[0]) if content else None
-    except Exception:
-        return True
-
-    if pid is None:
-        return True
-    return not _pid_alive(pid)
-
-
-def _pid_alive(pid: int) -> bool:
-    try:
-        os.kill(pid, 0)
-        return True
-    except Exception:
-        return False
+def _release_lock(lock: SyncFileLock) -> None:
+    lock.release()

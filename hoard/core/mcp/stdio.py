@@ -7,11 +7,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Optional
 
-import click
-
 from hoard import __version__
 from hoard.core.config import load_config, resolve_paths
 from hoard.core.db.connection import connect, ensure_sqlite_version
+from hoard.core.db.writer import WriteCoordinator
 from hoard.migrations import migrate
 from hoard.core.mcp.tools import count_chunks, dispatch_tool, is_write_tool, tool_definitions
 from hoard.core.security.auth import authenticate_token
@@ -34,6 +33,19 @@ class StdioMCPServer:
         paths = resolve_paths(self.config, config_path)
         self.db_path = paths.db_path
         self.state = StdioState()
+        self.allow_write_tools = bool(
+            self.config.get("mcp", {}).get("stdio", {}).get("allow_writes", False)
+        )
+        self.writer: WriteCoordinator | None = None
+        if self.allow_write_tools:
+            db_cfg = self.config.get("write", {}).get("database", {})
+            self.writer = WriteCoordinator(
+                db_path=self.db_path,
+                busy_timeout_ms=_int_or_default(db_cfg.get("busy_timeout_ms"), 5000),
+                lock_timeout_ms=_int_or_default(db_cfg.get("lock_timeout_ms"), 30000),
+                retry_budget_ms=_int_or_default(db_cfg.get("retry_budget_ms"), 30000),
+                retry_backoff_ms=min(_int_or_default(db_cfg.get("retry_backoff_ms"), 50), 500),
+            )
 
     def serve_forever(self) -> None:
         stdin = sys.stdin.buffer
@@ -134,29 +146,44 @@ class StdioMCPServer:
         limiter = RateLimiter(conn, self.config, enforce=False)
 
         try:
-            token = authenticate_token(token_value, self.config)
+            token = authenticate_token(token_value, self.config, conn)
             if is_write_tool(tool_name):
-                return self._build_error(
-                    msg_id,
-                    -32004,
-                    "Write tools require hoard serve (HTTP).",
-                )
+                if not self.allow_write_tools:
+                    return self._build_error(
+                        msg_id,
+                        -32004,
+                        "Write tools require hoard serve (HTTP) or mcp.stdio.allow_writes=true.",
+                    )
             limiter.check_request(token.name, tool_name)
-            response = dispatch_tool(tool_name, arguments, conn, self.config, token)
+            if is_write_tool(tool_name):
+                assert self.writer is not None
+                response = self.writer.submit(
+                    lambda writer_conn: dispatch_tool(
+                        tool_name, arguments, writer_conn, self.config, token
+                    )
+                )
+            else:
+                response = dispatch_tool(tool_name, arguments, conn, self.config, token)
             response_bytes = json.dumps(response).encode("utf-8")
             limiter.check_quota(token.name, count_chunks(response), len(response_bytes))
+            limiter.record_success(token.name, tool_name, count_chunks(response), len(response_bytes))
             content_result = {"content": [{"type": "text", "text": json.dumps(response)}]}
             return self._build_result(msg_id, content_result)
         except AuthError as exc:
+            limiter.record_failure(None, tool_name)
             return self._build_error(msg_id, -32001, str(exc))
         except ScopeError as exc:
+            limiter.record_failure(token.name if "token" in locals() else None, tool_name)
             return self._build_error(msg_id, -32002, str(exc))
         except RateLimitError as exc:
+            limiter.record_failure(token.name if "token" in locals() else None, tool_name)
             return self._build_error(msg_id, -32003, str(exc))
         except ValueError as exc:
+            limiter.record_failure(token.name if "token" in locals() else None, tool_name)
             log_access(conn, tool=tool_name, success=False, token_name=token.name)
             return self._build_error(msg_id, -32601, str(exc))
         except Exception as exc:
+            limiter.record_failure(token.name if "token" in locals() else None, tool_name)
             return self._build_error(msg_id, -32603, str(exc))
         finally:
             conn.close()
@@ -187,15 +214,27 @@ def run_stdio(config_path: Path | None = None) -> None:
         ensure_sqlite_version()
         migrate(conn, app_version=__version__)
     except Exception as exc:
-        click.echo(f"Failed to apply migrations: {exc}", err=True)
+        print(f"Failed to apply migrations: {exc}", file=sys.stderr)
         raise
     finally:
         conn.close()
 
-    server.serve_forever()
+    try:
+        server.serve_forever()
+    finally:
+        if server.writer is not None:
+            server.writer.stop()
 
 
 def _negotiate_version(requested: Optional[str]) -> str:
     if requested in SUPPORTED_PROTOCOL_VERSIONS:
         return requested
     return SUPPORTED_PROTOCOL_VERSIONS[0]
+
+
+def _int_or_default(value: Any, default: int) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return default
+    return parsed if parsed > 0 else default

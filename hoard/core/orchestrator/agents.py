@@ -5,12 +5,13 @@ import secrets
 import uuid
 from typing import Any, Dict, Iterable, List, Optional
 
+from hoard.core.errors import HoardError
 from hoard.core.orchestrator.utils import dumps, now_iso
 from hoard.core.security.agent_tokens import register_agent as register_agent_token
 from hoard.core.security.agent_tokens import delete_agent as delete_agent_token
 
 
-class AgentError(Exception):
+class AgentError(HoardError):
     pass
 
 

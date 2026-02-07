@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import os
 from pathlib import Path
 
 import pytest
@@ -8,6 +7,7 @@ import pytest
 from hoard.core.ingest.inbox import write_inbox_entry
 from hoard.core.memory.store import MemoryError, memory_get, memory_put
 from hoard.core.sync.service import sync_with_lock
+from hoard.core.sync.lock import SyncFileLock
 from hoard.core.db.connection import connect, initialize_db
 
 
@@ -59,9 +59,11 @@ def test_sync_lock_contention(tmp_path: Path) -> None:
     initialize_db(conn)
 
     lock_path = tmp_path / "sync.lock"
-    lock_path.write_text(f"{os.getpid()}\n0\n")
+    held_lock = SyncFileLock(lock_path)
+    assert held_lock.acquire(blocking=False)
 
     result = sync_with_lock(conn, {"connectors": {}}, lock_path=lock_path)
     assert result.get("skipped") is True
     assert result.get("reason") == "lock"
+    held_lock.release()
     conn.close()

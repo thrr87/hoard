@@ -6,7 +6,7 @@ from hoard.core.embeddings.model import EmbeddingError, EmbeddingModel
 from hoard.core.embeddings.store import build_embeddings
 from hoard.core.ingest.inbox import write_inbox_entry
 from hoard.core.ingest.sync import run_sync
-from hoard.core.security.errors import ScopeError
+from hoard.core.mcp.scopes import require_any_scope
 from hoard.core.sync.service import sync_with_lock
 
 
@@ -127,15 +127,15 @@ def dispatch_tool(tool: str, arguments: Dict[str, Any], conn, config: Dict[str, 
 
 
 def _require_sync(token) -> None:
-    if any(scope in token.scopes for scope in {"sync", "system.status", "system.sync"}):
-        return
-    raise ScopeError("Missing scopes: sync")
+    require_any_scope(
+        token,
+        {"sync", "system.status", "system.sync"},
+        message="Missing scopes: sync",
+    )
 
 
 def _require_ingest(token) -> None:
-    if any(scope in token.scopes for scope in {"ingest"}):
-        return
-    raise ScopeError("Missing scopes: ingest")
+    require_any_scope(token, {"ingest"}, message="Missing scopes: ingest")
 
 
 def _sync_status(conn) -> Dict[str, Any]:

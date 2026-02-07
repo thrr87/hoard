@@ -4,13 +4,13 @@ import hmac
 import hashlib
 import json
 from dataclasses import dataclass
-from datetime import datetime
 from typing import Iterable, List, Optional
 
 from argon2 import PasswordHasher, Type
 
 from hoard.core.security.errors import AuthError
 from hoard.core.security.server_secret import require_server_secret
+from hoard.core.time import utc_now_naive_iso
 
 
 @dataclass(frozen=True)
@@ -27,7 +27,7 @@ class AgentInfo:
 
 
 def _now_iso() -> str:
-    return datetime.utcnow().isoformat(timespec="seconds")
+    return utc_now_naive_iso(timespec="seconds")
 
 
 def _server_secret(config: dict) -> bytes:

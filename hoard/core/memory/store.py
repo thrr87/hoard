@@ -1,22 +1,28 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime, timedelta
+from datetime import timedelta
 from typing import Any, Dict, List, Optional
 
 from hoard.core.ingest.hash import compute_content_hash
+from hoard.core.errors import HoardError
 from hoard.core.memory.v2.store import MemoryError as V2MemoryError
+from hoard.core.memory.v2.store import memory_upsert as v2_memory_upsert
 from hoard.core.memory.v2.store import memory_query as v2_memory_query
-from hoard.core.memory.v2.store import memory_write as v2_memory_write
 from hoard.core.security.auth import TokenInfo
+from hoard.core.time import utc_now, utc_now_iso
 
 
-class MemoryError(Exception):
+class HoardMemoryError(HoardError):
     pass
 
 
+# Backward-compat alias for callers importing MemoryError.
+MemoryError = HoardMemoryError
+
+
 def _now_iso() -> str:
-    return datetime.utcnow().isoformat(timespec="seconds")
+    return utc_now_iso(timespec="seconds")
 
 
 def memory_put(
@@ -50,7 +56,7 @@ def memory_put(
 
     source_context = json.dumps({"legacy_key": key, "metadata": metadata} if metadata else {"legacy_key": key})
     try:
-        v2_memory_write(
+        v2_memory_upsert(
             conn,
             memory_id=entry_id,
             content=content,
@@ -63,8 +69,8 @@ def memory_put(
             expires_at=expires_value,
             config={},
         )
-    except V2MemoryError:
-        pass
+    except V2MemoryError as exc:
+        raise MemoryError(str(exc)) from exc
 
     conn.execute(
         """
@@ -258,5 +264,5 @@ def _resolve_expires_at(
     if ttl_days_int <= 0:
         return _now_iso()
 
-    expires_dt = datetime.utcnow() + timedelta(days=ttl_days_int)
+    expires_dt = utc_now() + timedelta(days=ttl_days_int)
     return expires_dt.isoformat(timespec="seconds")

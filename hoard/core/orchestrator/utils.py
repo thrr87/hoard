@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime
 from typing import Any
+
+from hoard.core.time import utc_now_naive_iso
 
 
 def now_iso() -> str:
-    return datetime.utcnow().isoformat(timespec="milliseconds")
+    return utc_now_naive_iso(timespec="milliseconds")
 
 
 def dumps(value: Any) -> str | None:

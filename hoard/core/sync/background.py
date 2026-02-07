@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import threading
 from pathlib import Path
 from typing import Callable, Optional
@@ -7,6 +8,8 @@ from typing import Callable, Optional
 from hoard.core.db.write_exec import WriteSubmit
 from hoard.core.sync.service import run_sync_with_lock
 from hoard.core.sync.watcher import WATCHDOG_AVAILABLE, SyncWatcher, build_watch_targets
+
+LOGGER = logging.getLogger(__name__)
 
 
 class BackgroundSync:
@@ -67,19 +70,25 @@ class BackgroundSync:
 
     def _schedule_loop(self, interval_minutes: int) -> None:
         while not self._stop.wait(interval_minutes * 60):
-            run_sync_with_lock(
-                self._config,
-                self._config_path,
-                source=None,
-                write_submit=self._write_submit,
-            )
+            try:
+                run_sync_with_lock(
+                    self._config,
+                    self._config_path,
+                    source=None,
+                    write_submit=self._write_submit,
+                )
+            except Exception:
+                LOGGER.exception("Background sync schedule iteration failed")
 
     def _sync_source(self, source: str) -> None:
         if self._stop.is_set():
             return
-        run_sync_with_lock(
-            self._config,
-            self._config_path,
-            source=source,
-            write_submit=self._write_submit,
-        )
+        try:
+            run_sync_with_lock(
+                self._config,
+                self._config_path,
+                source=source,
+                write_submit=self._write_submit,
+            )
+        except Exception:
+            LOGGER.exception("Background sync watcher trigger failed: %s", source)

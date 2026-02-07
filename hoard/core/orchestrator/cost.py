@@ -1,12 +1,14 @@
 from __future__ import annotations
 
-from datetime import datetime, timedelta
+from datetime import timedelta
 from typing import Any, Dict, List, Optional
 
+from hoard.core.errors import HoardError
 from hoard.core.orchestrator.utils import now_iso
+from hoard.core.time import utc_now_naive
 
 
-class CostError(Exception):
+class CostError(HoardError):
     pass
 
 
@@ -135,7 +137,7 @@ def cost_budget_status(
 
 
 def _period_bounds(period: str) -> tuple[str, str]:
-    now = datetime.utcnow()
+    now = utc_now_naive()
     if period == "today":
         start = now.replace(hour=0, minute=0, second=0, microsecond=0)
         end = start + timedelta(days=1)

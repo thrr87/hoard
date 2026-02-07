@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import re
-from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import yaml
+
+from hoard.core.time import utc_now_naive
 
 
 def write_inbox_entry(
@@ -43,7 +44,7 @@ def write_inbox_entry(
             safe_name += resolved_extension
     else:
         slug = _slugify(title or "inbox")
-        timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+        timestamp = utc_now_naive().strftime("%Y%m%d_%H%M%S")
         safe_name = f"{timestamp}_{slug}{resolved_extension}"
 
     path = inbox_path / safe_name
