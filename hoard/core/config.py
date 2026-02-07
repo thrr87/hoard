@@ -90,6 +90,9 @@ DEFAULT_CONFIG = {
         "auto_generate_server_secret": True,
         "database": {
             "busy_timeout_ms": 5000,
+            "lock_timeout_ms": 30000,
+            "retry_budget_ms": 30000,
+            "retry_backoff_ms": 50,
         },
         "slots": {
             "pattern": "^(pref|fact|ctx|decision|event):[a-z0-9_]+(\\.[a-z0-9_]+){0,3}$",

@@ -7,16 +7,17 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from hoard.core.config import default_data_path, resolve_paths
-from hoard.core.db.connection import connect, initialize_db
+from hoard.core.db.connection import initialize_db
+from hoard.core.db.write_exec import WriteSubmit, direct_submit, temporary_coordinator_submit
 from hoard.core.ingest.registry import iter_enabled_connectors
-from hoard.core.ingest.sync import sync_connector
+from hoard.core.ingest.sync import sync_connector_with_submit
 from hoard.core.memory.store import memory_prune
 from hoard.core.models import SyncStats
 
 
 def sync_connectors(
-    conn,
     config: dict,
+    write_submit: WriteSubmit,
     source: Optional[str] = None,
     on_entity: Optional[callable] = None,
 ) -> Dict[str, Any]:
@@ -38,7 +39,12 @@ def sync_connectors(
             )
             continue
 
-        stats = sync_connector(conn, connector, settings, on_entity=on_entity)
+        stats = sync_connector_with_submit(
+            connector,
+            settings,
+            submit_write=write_submit,
+            on_entity=on_entity,
+        )
         results.append(
             {
                 "source": name,
@@ -50,7 +56,7 @@ def sync_connectors(
 
     pruned = 0
     if config.get("memory", {}).get("prune_on_sync", True):
-        pruned = memory_prune(conn)
+        pruned = write_submit.submit(memory_prune)
 
     return {"connectors": results, "memory_pruned": pruned}
 
@@ -60,14 +66,28 @@ def run_sync_with_lock(
     config_path: Optional[Path] = None,
     source: Optional[str] = None,
     lock_path: Optional[Path] = None,
+    write_submit: WriteSubmit | None = None,
 ) -> Dict[str, Any]:
+    """Run a sync, acquiring the file-based sync lock to prevent overlaps."""
+    if write_submit is not None:
+        write_submit.submit(initialize_db)
+        return _sync_with_lock_submit(
+            config,
+            write_submit=write_submit,
+            source=source,
+            lock_path=lock_path,
+        )
+
     paths = resolve_paths(config, config_path)
-    conn = connect(paths.db_path)
-    initialize_db(conn)
-    try:
-        return sync_with_lock(conn, config, source=source, lock_path=lock_path)
-    finally:
-        conn.close()
+    db_cfg = config.get("write", {}).get("database", {})
+    with temporary_coordinator_submit(paths.db_path, db_cfg) as temp_submit:
+        temp_submit.submit(initialize_db)
+        return _sync_with_lock_submit(
+            config,
+            write_submit=temp_submit,
+            source=source,
+            lock_path=lock_path,
+        )
 
 
 def sync_with_lock(
@@ -76,11 +96,25 @@ def sync_with_lock(
     source: Optional[str] = None,
     lock_path: Optional[Path] = None,
 ) -> Dict[str, Any]:
+    return _sync_with_lock_submit(
+        config,
+        write_submit=direct_submit(conn),
+        source=source,
+        lock_path=lock_path,
+    )
+
+
+def _sync_with_lock_submit(
+    config: dict,
+    write_submit: WriteSubmit,
+    source: Optional[str] = None,
+    lock_path: Optional[Path] = None,
+) -> Dict[str, Any]:
     lock_path = lock_path or _lock_path()
     if not _acquire_lock(lock_path):
         return {"skipped": True, "reason": "lock"}
     try:
-        return sync_connectors(conn, config, source=source)
+        return sync_connectors(config, write_submit, source=source)
     finally:
         _release_lock(lock_path)
 
