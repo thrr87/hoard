@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from hoard.core.config import default_data_path, resolve_paths
-from hoard.core.db.connection import connect, initialize_db
+from hoard.core.db.connection import connect, initialize_db, write_locked
 from hoard.core.ingest.registry import iter_enabled_connectors
 from hoard.core.ingest.sync import sync_connector
 from hoard.core.memory.store import memory_prune
@@ -62,12 +62,9 @@ def run_sync_with_lock(
     lock_path: Optional[Path] = None,
 ) -> Dict[str, Any]:
     paths = resolve_paths(config, config_path)
-    conn = connect(paths.db_path)
-    initialize_db(conn)
-    try:
+    with write_locked(paths.db_path) as conn:
+        initialize_db(conn)
         return sync_with_lock(conn, config, source=source, lock_path=lock_path)
-    finally:
-        conn.close()
 
 
 def sync_with_lock(

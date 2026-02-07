@@ -30,7 +30,7 @@ from hoard.cli.instructions import (
     resolve_project_root,
 )
 from hoard.core.config import default_data_path, ensure_config_file, load_config, resolve_paths, save_config
-from hoard.core.db.connection import connect, initialize_db
+from hoard.core.db.connection import connect, initialize_db, write_locked
 from hoard.core.embeddings.model import EmbeddingError, EmbeddingModel
 from hoard.core.mcp.server import run_server
 from hoard.core.mcp.stdio import run_stdio
@@ -444,41 +444,37 @@ def db_migrate_command(target_version: int | None, config_path: Path | None) -> 
 
     config = load_config(config_path)
     paths = resolve_paths(config, config_path)
-    conn = connect(paths.db_path)
+    with write_locked(paths.db_path) as conn:
+        current = get_current_version(conn)
+        migrations = get_migrations()
+        latest = max(migrations.keys()) if migrations else 0
+        target = target_version if target_version is not None else latest
+        console.print(f"📦 Applying schema migrations (v{current} → v{target})...")
 
-    current = get_current_version(conn)
-    migrations = get_migrations()
-    latest = max(migrations.keys()) if migrations else 0
-    target = target_version if target_version is not None else latest
-    console.print(f"📦 Applying schema migrations (v{current} → v{target})...")
+        try:
+            applied = migrate(conn, target_version=target_version, app_version=__version__)
+        except MigrationError as exc:
+            raise click.ClickException(str(exc)) from exc
 
-    try:
-        applied = migrate(conn, target_version=target_version, app_version=__version__)
-    except MigrationError as exc:
-        conn.close()
-        raise click.ClickException(str(exc)) from exc
+        if not applied:
+            console.print("No pending migrations.")
+            return
 
-    if not applied:
-        console.print("No pending migrations.")
-        conn.close()
-        return
+        placeholders = ",".join("?" for _ in applied)
+        rows = conn.execute(
+            f"""
+            SELECT version, name, duration_ms
+            FROM schema_migrations
+            WHERE version IN ({placeholders})
+            ORDER BY version
+            """,
+            applied,
+        ).fetchall()
+        for row in rows:
+            _, name, duration_ms = row[0], row[1], row[2]
+            console.print(f"  {name} ... done ({duration_ms}ms)")
 
-    placeholders = ",".join("?" for _ in applied)
-    rows = conn.execute(
-        f"""
-        SELECT version, name, duration_ms
-        FROM schema_migrations
-        WHERE version IN ({placeholders})
-        ORDER BY version
-        """,
-        applied,
-    ).fetchall()
-    for row in rows:
-        _, name, duration_ms = row[0], row[1], row[2]
-        console.print(f"  {name} ... done ({duration_ms}ms)")
-
-    console.print(f"Migrated from version {current} to {applied[-1]}")
-    conn.close()
+        console.print(f"Migrated from version {current} to {applied[-1]}")
 
 
 @db_group.command("history")
@@ -573,23 +569,22 @@ def memory_put_command(
 ) -> None:
     config = load_config(config_path)
     paths = resolve_paths(config, config_path)
-    conn = connect(paths.db_path)
-    initialize_db(conn)
+    with write_locked(paths.db_path) as conn:
+        initialize_db(conn)
 
-    tag_list = [tag.strip() for tag in tags.split(",") if tag.strip()] if tags else []
-    metadata_obj = json.loads(metadata) if metadata else None
-    entry = memory_put(
-        conn,
-        key=key,
-        content=content,
-        tags=tag_list,
-        metadata=metadata_obj,
-        ttl_days=ttl_days,
-        expires_at=expires_at,
-        default_ttl_days=config.get("memory", {}).get("default_ttl_days"),
-    )
-    console.print_json(json.dumps(entry))
-    conn.close()
+        tag_list = [tag.strip() for tag in tags.split(",") if tag.strip()] if tags else []
+        metadata_obj = json.loads(metadata) if metadata else None
+        entry = memory_put(
+            conn,
+            key=key,
+            content=content,
+            tags=tag_list,
+            metadata=metadata_obj,
+            ttl_days=ttl_days,
+            expires_at=expires_at,
+            default_ttl_days=config.get("memory", {}).get("default_ttl_days"),
+        )
+        console.print_json(json.dumps(entry))
 
 
 @memory_group.command("get")
@@ -629,11 +624,9 @@ def memory_search_command(query: str, limit: int, config_path: Path | None) -> N
 def memory_prune_command(config_path: Path | None) -> None:
     config = load_config(config_path)
     paths = resolve_paths(config, config_path)
-    conn = connect(paths.db_path)
-    initialize_db(conn)
-
-    removed = memory_prune(conn)
-    conn.close()
+    with write_locked(paths.db_path) as conn:
+        initialize_db(conn)
+        removed = memory_prune(conn)
     console.print(f"Pruned {removed} expired memory entries.")
 
 

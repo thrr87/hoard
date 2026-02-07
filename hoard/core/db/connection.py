@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+import contextlib
 import sqlite3
 from pathlib import Path
-from typing import Iterable
+from typing import Generator, Iterable
 
 from hoard import __version__
 from hoard.migrations import migrate
@@ -14,6 +15,28 @@ def connect(db_path: Path, *, busy_timeout_ms: int | None = None) -> sqlite3.Con
     conn.row_factory = sqlite3.Row
     _apply_pragmas(conn, busy_timeout_ms=busy_timeout_ms)
     return conn
+
+
+@contextlib.contextmanager
+def write_locked(db_path: Path, *, busy_timeout_ms: int | None = None) -> Generator[sqlite3.Connection, None, None]:
+    """Open a connection and hold the cross-process write lock for its lifetime.
+
+    Use this instead of bare ``connect()`` whenever a CLI command or
+    background job needs to **write** to the database, so that writes are
+    serialised with the MCP server's ``WriteCoordinator``.
+    """
+    from hoard.core.db.lock import DatabaseWriteLock
+
+    lock = DatabaseWriteLock(db_path)
+    lock.acquire()
+    try:
+        conn = connect(db_path, busy_timeout_ms=busy_timeout_ms)
+        try:
+            yield conn
+        finally:
+            conn.close()
+    finally:
+        lock.release()
 
 
 def _apply_pragmas(conn: sqlite3.Connection, *, busy_timeout_ms: int | None = None) -> None:

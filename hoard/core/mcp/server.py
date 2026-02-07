@@ -14,6 +14,7 @@ import click
 from hoard import __version__
 from hoard.core.config import load_config, resolve_paths
 from hoard.core.db.connection import connect, ensure_sqlite_version
+from hoard.core.db.lock import DatabaseLockError, ServerSingletonLock
 from hoard.core.db.writer import WriteCoordinator
 from hoard.core.mcp.tools import count_chunks, dispatch_tool, is_write_tool, tool_definitions
 from hoard.core.orchestrator.events import poll_events
@@ -337,6 +338,19 @@ class MCPServer(ThreadingHTTPServer):
         super().__init__(server_address, RequestHandlerClass)
 
 
+def _check_no_other_server(db_path: Path) -> ServerSingletonLock:
+    """Verify no other ``hoard serve`` process is running on the same DB.
+
+    Acquires a non-blocking advisory lock on ``<db>.server``.  If another
+    server is already running, raises immediately with a clear message.
+
+    The returned lock **must** be kept alive for the server's lifetime.
+    """
+    lock = ServerSingletonLock(db_path)
+    lock.acquire_or_fail()
+    return lock
+
+
 def run_server(
     host: str = "127.0.0.1",
     port: int = 19850,
@@ -344,6 +358,10 @@ def run_server(
     no_migrate: bool = False,
 ) -> None:
     server = MCPServer((host, port), MCPRequestHandler, config_path)
+
+    # Hold an exclusive advisory lock for the server's entire lifetime so
+    # that a second ``hoard serve`` on the same DB is rejected immediately.
+    _server_lock = _check_no_other_server(server.db_path)  # noqa: F841
 
     conn = connect(server.db_path)
     try:
