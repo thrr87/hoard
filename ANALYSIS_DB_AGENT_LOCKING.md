@@ -6,13 +6,15 @@
 
 ## Short Answer
 
-Yes. Hoard uses a **five-layer defense** against write conflicts on a shared SQLite database:
+Yes. Hoard uses a **seven-layer defense** against write conflicts on a shared SQLite database:
 
 1. **WAL mode** (database-level) -- readers never block writers
 2. **WriteCoordinator** (process-level) -- serializes all writes through a single thread
-3. **Busy timeout** (connection-level) -- retries on `SQLITE_BUSY` for up to 5 seconds
-4. **Optimistic concurrency** (row-level) -- `rowcount` checks detect lost updates
-5. **Async conflict detection** (application-level) -- background jobs find semantic conflicts
+3. **Cross-process flock** (OS-level) -- `DatabaseWriteLock` serializes writes across processes
+4. **Server singleton lock** (OS-level) -- `ServerSingletonLock` prevents two servers on the same DB
+5. **Busy timeout** (connection-level) -- retries on `SQLITE_BUSY` for up to 5 seconds
+6. **Optimistic concurrency** (row-level) -- `rowcount` checks detect lost updates
+7. **Async conflict detection** (application-level) -- background jobs find semantic conflicts
 
 These layers work together so that multiple agents sharing one Hoard server will not corrupt data, lose writes, or deadlock.
 
@@ -59,7 +61,10 @@ class WriteCoordinator:
         return task.result
 ```
 
-The worker loop processes one task at a time, auto-committing on success and rolling back on error:
+The worker loop processes one task at a time. Each write is wrapped in a cross-process
+`DatabaseWriteLock` (flock), auto-committing on success and rolling back on error. If
+the flock cannot be acquired (another process is writing), the error is reported to the
+caller and the writer thread keeps running:
 
 ```python
 def _run(self):
@@ -67,13 +72,17 @@ def _run(self):
     while True:
         task = self._queue.get()
         try:
-            task.result = task.fn(self._conn, *task.args, **task.kwargs)
-            if self._conn.in_transaction:
-                self._conn.commit()
+            with self._lock:  # flock-based DatabaseWriteLock
+                try:
+                    task.result = task.fn(self._conn, *task.args, **task.kwargs)
+                    if self._conn.in_transaction:
+                        self._conn.commit()
+                except Exception as exc:
+                    if self._conn.in_transaction:
+                        self._conn.rollback()
+                    task.error = exc
         except Exception as exc:
-            if self._conn.in_transaction:
-                self._conn.rollback()
-            task.error = exc
+            task.error = exc  # lock failure -- report, don't crash
         finally:
             task.event.set()
 ```
@@ -95,7 +104,61 @@ Write tools go through `writer.submit()` (serialized). Read tools execute direct
 
 ---
 
-## Layer 3: Busy Timeout
+## Layer 3: Cross-Process Write Lock (flock)
+
+**File:** `hoard/core/db/lock.py`
+
+Every write processed by the `WriteCoordinator` is wrapped in a `DatabaseWriteLock` -- an
+exclusive `flock(2)` advisory lock on `<db_path>.lock`:
+
+```python
+# In WriteCoordinator._run():
+with self._lock:   # acquires flock(LOCK_EX)
+    task.result = task.fn(self._conn, ...)
+    self._conn.commit()
+                   # flock(LOCK_UN) released here
+```
+
+CLI commands that write (`memory put`, `memory prune`, `db migrate`) use the
+`write_locked()` context manager, which holds the same flock for the connection's lifetime:
+
+```python
+# In cli/main.py:
+with write_locked(paths.db_path) as conn:
+    initialize_db(conn)
+    memory_put(conn, ...)
+```
+
+Because both the server and CLI acquire the same flock file, writes are serialized across
+process boundaries -- not just within the server process.
+
+**Important caveat:** `flock` is per-open-file-description on Linux, not per-process. Two
+`open()` calls on the same file within the same process create independent locks that
+contend with each other. This is why `BackgroundSync` (which runs inside the server
+process) does **not** use `write_locked()` -- it would deadlock the `WriteCoordinator`.
+Instead, sync relies on SQLite WAL + busy_timeout for write safety.
+
+---
+
+## Layer 4: Server Singleton Lock
+
+**File:** `hoard/core/db/lock.py`, `hoard/core/mcp/server.py`
+
+On startup, `run_server()` acquires a `ServerSingletonLock` on `<db_path>.server` (a
+separate file from the write lock). This lock is held for the server's entire lifetime:
+
+```python
+_server_lock = _check_no_other_server(server.db_path)
+# ... server runs ...
+# lock released when process exits
+```
+
+If a second `hoard serve` attempts to start on the same database, it fails immediately
+with a clear error message instead of silently racing.
+
+---
+
+## Layer 5: Busy Timeout
 
 **File:** `hoard/core/config.py:92`
 
@@ -116,7 +179,7 @@ If a connection encounters `SQLITE_BUSY` (e.g., during migrations or if an exter
 
 ---
 
-## Layer 4: Optimistic Concurrency (Row-Level Conflict Detection)
+## Layer 6: Optimistic Concurrency (Row-Level Conflict Detection)
 
 Multiple operations use `UPDATE ... WHERE status = ? ... ` + `cursor.rowcount` as an **optimistic lock**:
 
@@ -153,7 +216,7 @@ Similar `rowcount > 0` checks guard memory updates and deletions.
 
 ---
 
-## Layer 5: Application-Level Conflict Detection
+## Layer 7: Application-Level Conflict Detection
 
 Hoard recognizes that even with serialized writes, **semantic conflicts** can occur (two agents writing different values to the same memory slot). These are handled asynchronously:
 
@@ -177,7 +240,7 @@ These are surfaced via MCP tools (`conflicts_list`, `conflict_resolve`, `duplica
 
 ---
 
-## Layer 6 (Bonus): File-Based Sync Lock
+## Layer 8 (Bonus): File-Based Sync Lock
 
 **File:** `hoard/core/sync/service.py:122-136`
 
@@ -212,19 +275,26 @@ Agent B writes memory ─┘
                             │
                             ▼
                   Single Writer Thread
-                  (one connection, one txn at a time)
                             │
-                  ┌─────────┼─────────┐
-                  │ Execute │ Commit  │
-                  │ A's fn  │ or      │
-                  │         │ Rollback│
-                  └─────────┼─────────┘
+                  ┌─────────┼──────────────┐
+                  │ flock(LOCK_EX) on       │
+                  │ hoard.db.lock           │
+                  │                         │
+                  │  Execute A's fn         │
+                  │  Commit or Rollback     │
+                  │                         │
+                  │ flock(LOCK_UN)          │
+                  └─────────┼──────────────┘
                             │
-                  ┌─────────┼─────────┐
-                  │ Execute │ Commit  │
-                  │ B's fn  │ or      │
-                  │         │ Rollback│
-                  └─────────┼─────────┘
+                  ┌─────────┼──────────────┐
+                  │ flock(LOCK_EX) on       │
+                  │ hoard.db.lock           │
+                  │                         │
+                  │  Execute B's fn         │
+                  │  Commit or Rollback     │
+                  │                         │
+                  │ flock(LOCK_UN)          │
+                  └─────────┼──────────────┘
                             │
                             ▼
               Background jobs detect conflicts/duplicates
@@ -233,17 +303,61 @@ Agent B writes memory ─┘
 1. Both requests arrive on separate HTTP threads
 2. Both call `writer.submit()`, enqueueing their operations
 3. The writer thread processes them **sequentially** (FIFO)
-4. Each gets its own transaction with auto-commit/rollback
-5. Neither agent sees a `SQLITE_BUSY` error or partial data
-6. Post-write background jobs check for semantic conflicts
+4. Each write acquires the cross-process `DatabaseWriteLock` (flock)
+5. Each gets its own transaction with auto-commit/rollback
+6. The flock is released after each write, so CLI commands can interleave between writes
+7. Neither agent sees a `SQLITE_BUSY` error or partial data
+8. Post-write background jobs check for semantic conflicts
 
 ---
 
-## Potential Gaps
+## What Happens When a CLI Command Writes While the Server is Running
+
+```
+hoard memory put "key" "value"       hoard serve (MCP server)
+         │                                    │
+         ▼                                    ▼
+  write_locked(db_path)            WriteCoordinator._run()
+         │                                    │
+  flock(LOCK_EX) on                    flock(LOCK_EX) on
+  hoard.db.lock ◄─── only one ───►    hoard.db.lock
+         │             at a time              │
+  INSERT + COMMIT                      (blocks until CLI
+         │                              releases the lock)
+  flock(LOCK_UN)                              │
+         │                              flock acquired
+         ▼                              Execute + Commit
+       done                             flock(LOCK_UN)
+```
+
+---
+
+## What Happens When Two Servers Are Started
+
+```
+$ hoard serve --port 19850
+  → ServerSingletonLock acquired on hoard.db.server ✓
+  → Server running
+
+$ hoard serve --port 19851   (same DB)
+  → ServerSingletonLock: try_acquire() → False
+  → ERROR: "Another hoard server is already running on this database."
+```
+
+---
+
+## Remaining Gaps
 
 | Gap | Severity | Notes |
 |-----|----------|-------|
-| **Single-process only** | Medium | The WriteCoordinator serializes writes within one server process. If two separate `hoard serve` processes point at the same DB file, they would rely solely on WAL + busy_timeout (no queue serialization). This is not a supported deployment. |
-| **No concurrent write tests** | Low | `test_http_mcp_concurrency.py` only tests concurrent reads (5 threads x 3 search calls). There are no tests exercising concurrent writes from multiple agents. |
 | **Task claim is not atomic SELECT+UPDATE** | Low | `_claim_job` in `worker.py:140-161` does a SELECT then UPDATE in two statements. This is safe because it runs inside the WriteCoordinator (single thread), but would be a race condition if used with direct connections. |
 | **Conflict resolution is manual** | Low | Detected conflicts require explicit resolution via MCP tools. There is no auto-merge strategy. |
+| **NFS/overlay filesystem caveat** | Low | `flock(2)` may not work correctly on network filesystems (NFS, some Docker volume drivers). This is a limitation of the OS, not the code. For Docker deployments, use local volumes. |
+
+### Previously Identified Gaps (Now Fixed)
+
+| Gap | Resolution |
+|-----|------------|
+| **Single-process only** | `WriteCoordinator` now holds a `DatabaseWriteLock` (flock) per write, serializing with CLI and sync processes. `ServerSingletonLock` prevents two servers on the same DB. |
+| **No concurrent write tests** | `tests/test_write_lock.py` includes 10 tests covering lock semantics, WriteCoordinator serialization, lock contention resilience, and 4-thread concurrent HTTP writes. |
+| **CLI writes bypass WriteCoordinator** | `memory put`, `memory prune`, and `db migrate` now use `write_locked()`, which holds the same flock as the WriteCoordinator. |
