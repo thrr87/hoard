@@ -81,7 +81,6 @@ def memory_put(
         """,
         (entry_id, key, content, tags_json, tags_text, metadata_json, now, now, expires_value),
     )
-    conn.commit()
 
     return {
         "id": entry_id,
@@ -233,7 +232,6 @@ def memory_prune(conn) -> int:
         "DELETE FROM memory_entries WHERE expires_at IS NOT NULL AND expires_at <= ?",
         (now,),
     )
-    conn.commit()
     return cursor.rowcount
 
 

@@ -61,6 +61,7 @@ def test_cli_search_json_includes_memory(tmp_path: Path) -> None:
     conn = connect(db_path)
     initialize_db(conn)
     memory_put(conn, key="context", content="Hoard memory entry")
+    conn.commit()
     conn.close()
 
     runner = CliRunner()
@@ -85,6 +86,7 @@ def test_cli_memory_prune(tmp_path: Path) -> None:
     conn = connect(db_path)
     initialize_db(conn)
     memory_put(conn, key="expired", content="old", expires_at="2000-01-01T00:00:00")
+    conn.commit()
     conn.close()
 
     runner = CliRunner()

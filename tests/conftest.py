@@ -34,3 +34,30 @@ def mcp_server() -> Callable[[Path], str]:
         server.shutdown()
         thread.join(timeout=2)
         server.server_close()
+        server.writer.stop()
+
+
+@pytest.fixture
+def mcp_server_with_instance() -> Callable[[Path], tuple[str, MCPServer]]:
+    servers: List[Tuple[MCPServer, threading.Thread]] = []
+
+    def _start(config_path: Path) -> tuple[str, MCPServer]:
+        config = load_config(config_path)
+        paths = resolve_paths(config, config_path)
+        conn = connect(paths.db_path)
+        initialize_db(conn)
+        conn.close()
+        server = MCPServer(("127.0.0.1", 0), MCPRequestHandler, config_path)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        servers.append((server, thread))
+        url = f"http://127.0.0.1:{server.server_address[1]}/mcp"
+        return url, server
+
+    yield _start
+
+    for server, thread in servers:
+        server.shutdown()
+        thread.join(timeout=2)
+        server.server_close()
+        server.writer.stop()

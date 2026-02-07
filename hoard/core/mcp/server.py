@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 import time
 import urllib.parse
 from datetime import datetime, timezone
@@ -14,18 +15,19 @@ import click
 from hoard import __version__
 from hoard.core.config import load_config, resolve_paths
 from hoard.core.db.connection import connect, ensure_sqlite_version
-from hoard.core.db.lock import DatabaseLockError, ServerSingletonLock
+from hoard.core.db.lock import ServerSingletonLock
 from hoard.core.db.writer import WriteCoordinator
 from hoard.core.mcp.tools import count_chunks, dispatch_tool, is_write_tool, tool_definitions
 from hoard.core.orchestrator.events import poll_events
 from hoard.core.security.agent_tokens import ensure_agent_from_config
-from hoard.migrations import get_current_version, get_migrations, migrate
 from hoard.core.security.audit import log_access
 from hoard.core.security.auth import TokenInfo, authenticate_token
 from hoard.core.security.errors import AuthError, ScopeError
-from hoard.core.security.limits import RateLimitError, RateLimiter
+from hoard.core.security.limits import RateLimiter, RateLimitError
 from hoard.core.security.server_secret import require_server_secret, resolve_server_secret
+from hoard.core.sync.background import BackgroundSync
 from hoard.core.worker import Worker
+from hoard.migrations import get_current_version, get_migrations, migrate
 
 SUPPORTED_PROTOCOL_VERSIONS = ["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"]
 
@@ -328,14 +330,20 @@ class MCPRequestHandler(BaseHTTPRequestHandler):
 
 
 class MCPServer(ThreadingHTTPServer):
-    def __init__(self, server_address, RequestHandlerClass, config_path: Path | None) -> None:
+    def __init__(self, server_address, request_handler_class, config_path: Path | None) -> None:
         self.config = load_config(config_path)
         paths = resolve_paths(self.config, config_path)
         self.db_path = paths.db_path
-        busy_timeout = int(self.config.get("write", {}).get("database", {}).get("busy_timeout_ms", 0) or 0)
-        self.writer = WriteCoordinator(db_path=self.db_path, busy_timeout_ms=busy_timeout or None)
+        db_cfg = self.config.get("write", {}).get("database", {})
+        self.writer = WriteCoordinator(
+            db_path=self.db_path,
+            busy_timeout_ms=_int_or_default(db_cfg.get("busy_timeout_ms"), 5000),
+            lock_timeout_ms=_int_or_default(db_cfg.get("lock_timeout_ms"), 30000),
+            retry_budget_ms=_int_or_default(db_cfg.get("retry_budget_ms"), 30000),
+            retry_backoff_ms=min(_int_or_default(db_cfg.get("retry_backoff_ms"), 50), 500),
+        )
         self.worker = Worker(db_path=self.db_path, config=self.config, writer=self.writer)
-        super().__init__(server_address, RequestHandlerClass)
+        super().__init__(server_address, request_handler_class)
 
 
 def _check_no_other_server(db_path: Path) -> ServerSingletonLock:
@@ -356,32 +364,60 @@ def run_server(
     port: int = 19850,
     config_path: Path | None = None,
     no_migrate: bool = False,
+    stop_event: threading.Event | None = None,
 ) -> None:
     server = MCPServer((host, port), MCPRequestHandler, config_path)
+    background = BackgroundSync(
+        config=server.config,
+        config_path=config_path,
+        log=click.echo,
+        write_submit=server.writer,
+    )
 
-    # Hold an exclusive advisory lock for the server's entire lifetime so
-    # that a second ``hoard serve`` on the same DB is rejected immediately.
-    _server_lock = _check_no_other_server(server.db_path)  # noqa: F841
-
-    conn = connect(server.db_path)
+    server_lock: ServerSingletonLock | None = None
+    worker_started = False
+    background_started = False
     try:
-        ensure_sqlite_version()
-        _require_server_secret(server.config)
-        if no_migrate:
-            migrations = get_migrations()
-            latest = max(migrations.keys()) if migrations else 0
-            current = get_current_version(conn)
-            if current < latest:
-                click.echo(f"⚠️  Schema migrations pending (v{current} → v{latest})")
-                click.echo("   Run 'hoard db migrate' or restart without --no-migrate")
-        else:
-            migrate(conn, app_version=__version__)
-        _bootstrap_tokens(conn, server.config)
-    finally:
-        conn.close()
+        # Hold an exclusive advisory lock for the server's entire lifetime so
+        # that a second ``hoard serve`` on the same DB is rejected immediately.
+        server_lock = _check_no_other_server(server.db_path)
 
-    server.worker.start()
-    server.serve_forever()
+        conn = connect(server.db_path)
+        try:
+            ensure_sqlite_version()
+            _require_server_secret(server.config)
+            if no_migrate:
+                migrations = get_migrations()
+                latest = max(migrations.keys()) if migrations else 0
+                current = get_current_version(conn)
+                if current < latest:
+                    click.echo(f"⚠️  Schema migrations pending (v{current} → v{latest})")
+                    click.echo("   Run 'hoard db migrate' or restart without --no-migrate")
+            else:
+                migrate(conn, app_version=__version__)
+            _bootstrap_tokens(conn, server.config)
+        finally:
+            conn.close()
+
+        server.worker.start()
+        worker_started = True
+        background.start()
+        background_started = True
+        if stop_event is None:
+            server.serve_forever()
+        else:
+            server.timeout = 0.2
+            while not stop_event.is_set():
+                server.handle_request()
+    finally:
+        if background_started:
+            background.stop()
+        if worker_started:
+            server.worker.stop()
+        server.writer.stop()
+        server.server_close()
+        if server_lock is not None:
+            server_lock.release()
 
 
 def _wrap_tool_result(response: Dict[str, Any]) -> Dict[str, Any]:
@@ -433,3 +469,11 @@ def _require_event_read(token: TokenInfo) -> None:
     if "event.read" in token.scopes:
         return
     raise ScopeError("Missing scopes: event.read")
+
+
+def _int_or_default(value: Any, default: int) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return default
+    return parsed if parsed > 0 else default

@@ -32,7 +32,7 @@ class DatabaseLockError(Exception):
 class _AdvisoryLock:
     """Low-level ``flock(2)``-based advisory lock on a file path."""
 
-    def __init__(self, lock_path: Path, *, timeout_seconds: float = 10.0) -> None:
+    def __init__(self, lock_path: Path, *, timeout_seconds: float = 30.0) -> None:
         self._lock_path = lock_path
         self._timeout = timeout_seconds
         self._fd: Optional[int] = None
@@ -101,7 +101,7 @@ class DatabaseWriteLock(_AdvisoryLock):
             conn.commit()
     """
 
-    def __init__(self, db_path: Path, *, timeout_seconds: float = 10.0) -> None:
+    def __init__(self, db_path: Path, *, timeout_seconds: float = 30.0) -> None:
         lock_path = db_path.with_suffix(db_path.suffix + ".lock")
         super().__init__(lock_path, timeout_seconds=timeout_seconds)
 
@@ -122,7 +122,7 @@ class ServerSingletonLock(_AdvisoryLock):
         """Acquire the lock or raise ``DatabaseLockError`` immediately."""
         if not self.try_acquire():
             raise DatabaseLockError(
-                f"Another hoard server is already running on this database.\n"
+                "Another hoard server is already running on this database.\n"
                 "Only one server may write to a database at a time.\n"
                 "Stop the other process first, or use a different storage.db_path."
             )

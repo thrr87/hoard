@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from typing import Iterable
 
+from hoard.core.db.write_exec import WriteSubmit, direct_submit
+from hoard.core.ingest.registry import iter_enabled_connectors
 from hoard.core.ingest.store import (
     get_entity_by_source,
     replace_chunks,
@@ -9,15 +11,14 @@ from hoard.core.ingest.store import (
     upsert_entity,
 )
 from hoard.core.models import SyncStats
-from hoard.core.ingest.registry import iter_enabled_connectors
 from hoard.sdk.base import ConnectorV1
 from hoard.sdk.types import EntityInput
 
 
-def sync_connector(
-    conn,
+def sync_connector_with_submit(
     connector: ConnectorV1,
     config: dict,
+    submit_write: WriteSubmit,
     on_entity: callable | None = None,
 ) -> SyncStats:
     stats = SyncStats()
@@ -32,14 +33,10 @@ def sync_connector(
 
             try:
                 _apply_provenance(connector, entity)
-                existing = get_entity_by_source(conn, entity.source, entity.source_id)
-                entity_id = upsert_entity(conn, entity)
+                unchanged, chunk_count = submit_write.submit(_upsert_entity_and_chunks, entity, chunks)
                 seen_source_ids.append(entity.source_id)
-
-                if existing and existing.get("content_hash") == entity.content_hash:
-                    continue
-
-                stats.chunks_written += replace_chunks(conn, entity_id, chunks)
+                if not unchanged:
+                    stats.chunks_written += chunk_count
             except Exception:
                 stats.errors += 1
                 continue
@@ -48,12 +45,30 @@ def sync_connector(
         scan_failed = True
 
     if not scan_failed:
-        stats.entities_tombstoned = tombstone_missing(
-            conn, connector.source_name, seen_source_ids
-        )
-    conn.commit()
+        try:
+            stats.entities_tombstoned = submit_write.submit(
+                _tombstone_missing,
+                connector.source_name,
+                seen_source_ids,
+            )
+        except Exception:
+            stats.errors += 1
     connector.cleanup()
     return stats
+
+
+def sync_connector(
+    conn,
+    connector: ConnectorV1,
+    config: dict,
+    on_entity: callable | None = None,
+) -> SyncStats:
+    return sync_connector_with_submit(
+        connector,
+        config,
+        submit_write=direct_submit(conn),
+        on_entity=on_entity,
+    )
 
 
 def _apply_provenance(connector: ConnectorV1, entity: EntityInput) -> None:
@@ -79,3 +94,15 @@ def run_sync(conn, *, config: dict, source: str | None = None) -> dict:
             "started_at": stats.started_at.isoformat(timespec="seconds"),
         }
     return results
+
+
+def _upsert_entity_and_chunks(conn, entity: EntityInput, chunks: list) -> tuple[bool, int]:
+    existing = get_entity_by_source(conn, entity.source, entity.source_id)
+    entity_id = upsert_entity(conn, entity)
+    if existing and existing.get("content_hash") == entity.content_hash:
+        return True, 0
+    return False, replace_chunks(conn, entity_id, chunks)
+
+
+def _tombstone_missing(conn, source: str, seen_source_ids: Iterable[str]) -> int:
+    return tombstone_missing(conn, source, seen_source_ids)

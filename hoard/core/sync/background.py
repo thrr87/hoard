@@ -1,10 +1,10 @@
 from __future__ import annotations
 
 import threading
-import time
 from pathlib import Path
 from typing import Callable, Optional
 
+from hoard.core.db.write_exec import WriteSubmit
 from hoard.core.sync.service import run_sync_with_lock
 from hoard.core.sync.watcher import WATCHDOG_AVAILABLE, SyncWatcher, build_watch_targets
 
@@ -16,12 +16,15 @@ class BackgroundSync:
         config: dict,
         config_path: Optional[Path] = None,
         log: Optional[Callable[[str], None]] = None,
+        write_submit: WriteSubmit | None = None,
     ) -> None:
         self._config = config
         self._config_path = config_path
         self._log = log or (lambda msg: None)
+        self._write_submit = write_submit
         self._scheduler_thread: Optional[threading.Thread] = None
         self._watcher: Optional[SyncWatcher] = None
+        self._stop = threading.Event()
 
     def start(self) -> None:
         interval = int(self._config.get("sync", {}).get("interval_minutes", 0) or 0)
@@ -54,10 +57,29 @@ class BackgroundSync:
             self._watcher.start()
             self._log("File watcher enabled.")
 
+    def stop(self) -> None:
+        self._stop.set()
+        if self._watcher:
+            self._watcher.stop()
+            self._watcher = None
+        if self._scheduler_thread and self._scheduler_thread.is_alive():
+            self._scheduler_thread.join(timeout=2)
+
     def _schedule_loop(self, interval_minutes: int) -> None:
-        while True:
-            time.sleep(interval_minutes * 60)
-            run_sync_with_lock(self._config, self._config_path, source=None)
+        while not self._stop.wait(interval_minutes * 60):
+            run_sync_with_lock(
+                self._config,
+                self._config_path,
+                source=None,
+                write_submit=self._write_submit,
+            )
 
     def _sync_source(self, source: str) -> None:
-        run_sync_with_lock(self._config, self._config_path, source=source)
+        if self._stop.is_set():
+            return
+        run_sync_with_lock(
+            self._config,
+            self._config_path,
+            source=source,
+            write_submit=self._write_submit,
+        )

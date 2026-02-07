@@ -134,9 +134,9 @@ process boundaries -- not just within the server process.
 
 **Important caveat:** `flock` is per-open-file-description on Linux, not per-process. Two
 `open()` calls on the same file within the same process create independent locks that
-contend with each other. This is why `BackgroundSync` (which runs inside the server
-process) does **not** use `write_locked()` -- it would deadlock the `WriteCoordinator`.
-Instead, sync relies on SQLite WAL + busy_timeout for write safety.
+contend with each other. Hoard avoids this by routing background sync writes through
+the server's `WriteCoordinator.submit()` path, so in-process sync and MCP writes share
+the same write queue and lock policy.
 
 ---
 

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-import json
 import ipaddress
+import json
 import os
 import secrets
 import shutil
@@ -29,7 +29,13 @@ from hoard.cli.instructions import (
     render_instruction_block,
     resolve_project_root,
 )
-from hoard.core.config import default_data_path, ensure_config_file, load_config, resolve_paths, save_config
+from hoard.core.config import (
+    default_data_path,
+    ensure_config_file,
+    load_config,
+    resolve_paths,
+    save_config,
+)
 from hoard.core.db.connection import connect, initialize_db, write_locked
 from hoard.core.embeddings.model import EmbeddingError, EmbeddingModel
 from hoard.core.mcp.server import run_server
@@ -50,13 +56,27 @@ from hoard.core.security.server_secret import (
     server_secret_env_key,
     server_secret_file_path,
 )
-from hoard.core.sync.background import BackgroundSync
 from hoard.core.sync.service import run_sync_with_lock
 from hoard.core.sync.watcher import WATCHDOG_AVAILABLE
 from hoard.sdk.retry import run_with_retry, should_retry_http_exception
 
 console = Console()
 DEFAULT_AGENT_SCOPES = ["search", "get", "memory", "sync", "ingest"]
+
+
+def _write_db_timeouts(config: dict) -> tuple[int, int]:
+    db_cfg = config.get("write", {}).get("database", {})
+    busy_timeout_ms = _int_or_default(db_cfg.get("busy_timeout_ms"), 5000)
+    lock_timeout_ms = _int_or_default(db_cfg.get("lock_timeout_ms"), 30000)
+    return busy_timeout_ms, lock_timeout_ms
+
+
+def _int_or_default(value: object, default: int) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return default
+    return parsed if parsed > 0 else default
 
 
 def _server_base_url(config: dict) -> str:
@@ -444,7 +464,12 @@ def db_migrate_command(target_version: int | None, config_path: Path | None) -> 
 
     config = load_config(config_path)
     paths = resolve_paths(config, config_path)
-    with write_locked(paths.db_path) as conn:
+    busy_timeout_ms, lock_timeout_ms = _write_db_timeouts(config)
+    with write_locked(
+        paths.db_path,
+        busy_timeout_ms=busy_timeout_ms,
+        lock_timeout_ms=lock_timeout_ms,
+    ) as conn:
         current = get_current_version(conn)
         migrations = get_migrations()
         latest = max(migrations.keys()) if migrations else 0
@@ -569,7 +594,12 @@ def memory_put_command(
 ) -> None:
     config = load_config(config_path)
     paths = resolve_paths(config, config_path)
-    with write_locked(paths.db_path) as conn:
+    busy_timeout_ms, lock_timeout_ms = _write_db_timeouts(config)
+    with write_locked(
+        paths.db_path,
+        busy_timeout_ms=busy_timeout_ms,
+        lock_timeout_ms=lock_timeout_ms,
+    ) as conn:
         initialize_db(conn)
 
         tag_list = [tag.strip() for tag in tags.split(",") if tag.strip()] if tags else []
@@ -624,7 +654,12 @@ def memory_search_command(query: str, limit: int, config_path: Path | None) -> N
 def memory_prune_command(config_path: Path | None) -> None:
     config = load_config(config_path)
     paths = resolve_paths(config, config_path)
-    with write_locked(paths.db_path) as conn:
+    busy_timeout_ms, lock_timeout_ms = _write_db_timeouts(config)
+    with write_locked(
+        paths.db_path,
+        busy_timeout_ms=busy_timeout_ms,
+        lock_timeout_ms=lock_timeout_ms,
+    ) as conn:
         initialize_db(conn)
         removed = memory_prune(conn)
     console.print(f"Pruned {removed} expired memory entries.")
@@ -1290,9 +1325,6 @@ def serve_command(
         _serve_daemon(host, port, no_migrate=no_migrate, allow_remote=allow_remote)
         return
 
-    background = BackgroundSync(config=config, config_path=None, log=console.print)
-    background.start()
-
     console.print(f"Starting Hoard server on http://{host}:{port}/mcp")
     run_server(host=host, port=port, config_path=None, no_migrate=no_migrate)
 
@@ -1326,8 +1358,6 @@ def mcp_serve_command(
             raise click.ClickException(str(exc)) from exc
         if not had_secret and source == "file":
             console.print(f"Generated server secret in {server_secret_file_path(config)}")
-    background = BackgroundSync(config=config, config_path=config_path, log=console.print)
-    background.start()
     console.print(f"Starting MCP server on {host}:{port}")
     run_server(host=host, port=port, config_path=config_path, no_migrate=no_migrate)
 

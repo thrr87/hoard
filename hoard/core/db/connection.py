@@ -18,7 +18,12 @@ def connect(db_path: Path, *, busy_timeout_ms: int | None = None) -> sqlite3.Con
 
 
 @contextlib.contextmanager
-def write_locked(db_path: Path, *, busy_timeout_ms: int | None = None) -> Generator[sqlite3.Connection, None, None]:
+def write_locked(
+    db_path: Path,
+    *,
+    busy_timeout_ms: int | None = None,
+    lock_timeout_ms: int | None = None,
+) -> Generator[sqlite3.Connection, None, None]:
     """Open a connection and hold the cross-process write lock for its lifetime.
 
     Use this instead of bare ``connect()`` whenever a CLI command or
@@ -27,12 +32,19 @@ def write_locked(db_path: Path, *, busy_timeout_ms: int | None = None) -> Genera
     """
     from hoard.core.db.lock import DatabaseWriteLock
 
-    lock = DatabaseWriteLock(db_path)
+    timeout_ms = lock_timeout_ms if lock_timeout_ms and lock_timeout_ms > 0 else 30000
+    lock = DatabaseWriteLock(db_path, timeout_seconds=timeout_ms / 1000)
     lock.acquire()
     try:
         conn = connect(db_path, busy_timeout_ms=busy_timeout_ms)
         try:
             yield conn
+            if conn.in_transaction:
+                conn.commit()
+        except Exception:
+            if conn.in_transaction:
+                conn.rollback()
+            raise
         finally:
             conn.close()
     finally:

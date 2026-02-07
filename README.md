@@ -190,6 +190,16 @@ Admin tasks (token management) use the same secret:
 hoard tokens add claude-code --scopes search,get,memory,sync
 ```
 
+Write coordination defaults (in `${HOARD_DATA_DIR:-~/.hoard}/config.yaml`):
+```yaml
+write:
+  database:
+    busy_timeout_ms: 5000
+    lock_timeout_ms: 30000
+    retry_budget_ms: 30000
+    retry_backoff_ms: 50
+```
+
 ### MCP Clients
 ```bash
 hoard setup --all
