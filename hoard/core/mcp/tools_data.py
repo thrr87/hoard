@@ -4,9 +4,9 @@ from typing import Any, Dict, List, Optional
 
 from hoard.core.memory.store import memory_get_by_id
 from hoard.core.memory.v2.store import memory_get as memory_get_v2
+from hoard.core.mcp.scopes import has_any_scope, require_any_scope
 from hoard.core.search.getters import get_chunk, get_entity
 from hoard.core.search.service import search_entities
-from hoard.core.security.errors import ScopeError
 
 
 TOOL_DEFINITIONS: List[Dict[str, Any]] = [
@@ -103,7 +103,7 @@ WRITE_TOOLS: set[str] = set()
 
 def dispatch_tool(tool: str, arguments: Dict[str, Any], conn, config: Dict[str, Any], token):
     if tool == "search":
-        _require_any_scope(token, {"search", "data.search"})
+        require_any_scope(token, {"search", "data.search"})
         query = arguments.get("query", "")
         limit = int(arguments.get("limit", 20))
         cursor = arguments.get("cursor")
@@ -136,7 +136,7 @@ def dispatch_tool(tool: str, arguments: Dict[str, Any], conn, config: Dict[str, 
         return {"results": results, "next_cursor": next_cursor}
 
     if tool == "get":
-        _require_any_scope(token, {"get", "data.get"})
+        require_any_scope(token, {"get", "data.get"})
         entity_id = arguments.get("entity_id")
         entity = get_entity(conn, entity_id, allow_sensitive=token.can_access_sensitive)
         if entity is not None:
@@ -154,7 +154,7 @@ def dispatch_tool(tool: str, arguments: Dict[str, Any], conn, config: Dict[str, 
         return {"entity": None}
 
     if tool == "get_chunk":
-        _require_any_scope(token, {"get", "data.get"})
+        require_any_scope(token, {"get", "data.get"})
         chunk_id = arguments.get("chunk_id")
         context_chunks = int(arguments.get("context_chunks", 0) or 0)
         return {
@@ -169,13 +169,8 @@ def dispatch_tool(tool: str, arguments: Dict[str, Any], conn, config: Dict[str, 
     return None
 
 
-def _require_any_scope(token, scopes: set[str]) -> None:
-    if not any(scope in token.scopes for scope in scopes):
-        raise ScopeError(f"Missing scopes: {', '.join(sorted(scopes))}")
-
-
 def _has_memory_scope(token) -> bool:
-    return any(scope in token.scopes for scope in {"memory", "memory.read", "memory.write"})
+    return has_any_scope(token, {"memory", "memory.read", "memory.write"})
 
 
 def _memory_to_entity(entry: Dict[str, Any]) -> Dict[str, Any]:

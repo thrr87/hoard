@@ -6,11 +6,12 @@ import uuid
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 
+from hoard.core.errors import HoardError
 from hoard.core.orchestrator.events import publish_event
 from hoard.core.orchestrator.utils import dumps, now_iso
 
 
-class WorkflowError(Exception):
+class WorkflowError(HoardError):
     pass
 
 

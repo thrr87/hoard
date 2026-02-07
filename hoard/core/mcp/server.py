@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import hmac
 import json
+import logging
 import os
 import threading
 import time
@@ -10,17 +12,16 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Dict
 
-import click
-
 from hoard import __version__
 from hoard.core.config import load_config, resolve_paths
 from hoard.core.db.connection import connect, ensure_sqlite_version
 from hoard.core.db.lock import ServerSingletonLock
 from hoard.core.db.writer import WriteCoordinator
 from hoard.core.mcp.tools import count_chunks, dispatch_tool, is_write_tool, tool_definitions
+from hoard.core.observability.logging import configure_logging
 from hoard.core.orchestrator.events import poll_events
 from hoard.core.security.agent_tokens import ensure_agent_from_config
-from hoard.core.security.audit import log_access
+from hoard.core.security.audit_async import AsyncAuditSink
 from hoard.core.security.auth import TokenInfo, authenticate_token
 from hoard.core.security.errors import AuthError, ScopeError
 from hoard.core.security.limits import RateLimiter, RateLimitError
@@ -30,24 +31,33 @@ from hoard.core.worker import Worker
 from hoard.migrations import get_current_version, get_migrations, migrate
 
 SUPPORTED_PROTOCOL_VERSIONS = ["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"]
+LOGGER = logging.getLogger(__name__)
 
 
 class MCPRequestHandler(BaseHTTPRequestHandler):
     server_version = "HoardMCP/0.1"
 
     def do_POST(self) -> None:  # noqa: N802
+        self.server.note_request()
         try:
             if self.path == "/mcp":
                 self._handle_jsonrpc()
             else:
                 self._handle_custom_http()
         except Exception as exc:
+            self.server.note_error()
+            LOGGER.exception("Unhandled HTTP request exception")
             self._write_json(500, {"error": str(exc)})
 
     def do_GET(self) -> None:  # noqa: N802
+        self.server.note_request()
         if self.path == "/health":
             self._handle_health()
             return
+        if self.path == "/metrics":
+            if self.server.config.get("observability", {}).get("metrics_enabled", True):
+                self._handle_metrics()
+                return
         if self.path == "/sync_status":
             self._handle_custom_http()
             return
@@ -108,6 +118,7 @@ class MCPRequestHandler(BaseHTTPRequestHandler):
             response = self._dispatch_tool(tool, payload, conn, token)
             response_bytes = json.dumps(response).encode("utf-8")
             limiter.check_quota(token.name, count_chunks(response), len(response_bytes))
+            limiter.record_success(token.name, tool, count_chunks(response), len(response_bytes))
             self._log_access(
                 tool=tool,
                 success=True,
@@ -118,16 +129,23 @@ class MCPRequestHandler(BaseHTTPRequestHandler):
             )
             self._write_json(200, response)
         except AuthError as exc:
+            self.server.note_error()
+            limiter.record_failure(getattr(token, "name", None), tool)
             self._log_access(tool=tool, success=False, token_name=None)
             self._write_json(401, {"error": str(exc)})
         except ScopeError as exc:
+            self.server.note_error()
+            limiter.record_failure(getattr(token, "name", None), tool)
             self._log_access(tool=tool, success=False, token_name=getattr(token, "name", None))
             self._write_json(403, {"error": str(exc)})
         except RateLimitError as exc:
+            self.server.note_error()
+            limiter.record_failure(getattr(token, "name", None), tool)
             self._log_access(tool=tool, success=False, token_name=getattr(token, "name", None))
             self._write_json(429, {"error": str(exc)})
         finally:
             conn.close()
+            self.server.maybe_checkpoint()
 
     def _handle_jsonrpc(self) -> None:
         length = int(self.headers.get("Content-Length", "0"))
@@ -142,33 +160,50 @@ class MCPRequestHandler(BaseHTTPRequestHandler):
             response = self._dispatch_jsonrpc(payload, conn, limiter, token)
             self._write_json(200, response)
         except AuthError as exc:
+            self.server.note_error()
             self._write_json(401, _jsonrpc_error(payload, -32001, str(exc)))
         except ScopeError as exc:
+            self.server.note_error()
             self._write_json(403, _jsonrpc_error(payload, -32002, str(exc)))
         except RateLimitError as exc:
+            self.server.note_error()
             self._write_json(429, _jsonrpc_error(payload, -32003, str(exc)))
         finally:
             conn.close()
+            self.server.maybe_checkpoint()
 
     def _handle_events(self) -> None:
         parsed = urllib.parse.urlparse(self.path)
         params = urllib.parse.parse_qs(parsed.query)
         since = params.get("since", [None])[0]
         limit = int(params.get("limit", [50])[0] or 50)
+        poll_interval = float(self.server.config.get("server", {}).get("sse_poll_interval_seconds", 1.0))
+        max_connection_seconds = int(
+            self.server.config.get("server", {}).get("sse_max_connection_seconds", 300)
+        )
 
-        conn = connect(self.server.db_path)
         try:
-            token = self._authenticate(conn)
+            auth_conn = connect(self.server.db_path)
+            try:
+                token = self._authenticate(auth_conn)
+            finally:
+                auth_conn.close()
             _require_event_read(token)
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream")
             self.send_header("Cache-Control", "no-cache")
             self.send_header("Connection", "keep-alive")
             self.end_headers()
+            self.server.note_sse_change(delta=1)
 
             last_seen = self.headers.get("Last-Event-ID") or since
-            while True:
-                events = poll_events(conn, since=last_seen, limit=limit)
+            started_at = time.time()
+            while time.time() - started_at < max_connection_seconds:
+                poll_conn = connect(self.server.db_path)
+                try:
+                    events = poll_events(poll_conn, since=last_seen, limit=limit)
+                finally:
+                    poll_conn.close()
                 for event in events:
                     payload = json.dumps(event)
                     self.wfile.write(f"id: {event['published_at']}\n".encode("utf-8"))
@@ -177,13 +212,15 @@ class MCPRequestHandler(BaseHTTPRequestHandler):
                     last_seen = event["published_at"]
                 self.wfile.write(b": keep-alive\n\n")
                 self.wfile.flush()
-                time.sleep(1)
+                self.server.maybe_checkpoint()
+                time.sleep(max(poll_interval, 0.1))
         except (AuthError, ScopeError) as exc:
+            self.server.note_error()
             self._write_json(403, {"error": str(exc)})
         except (BrokenPipeError, ConnectionResetError):
             return
         finally:
-            conn.close()
+            self.server.note_sse_change(delta=-1)
 
     def _dispatch_jsonrpc(self, payload: Dict[str, Any], conn, limiter, token):
         if not isinstance(payload, dict):
@@ -210,7 +247,13 @@ class MCPRequestHandler(BaseHTTPRequestHandler):
             return {
                 "jsonrpc": "2.0",
                 "id": msg_id,
-                "result": {"tools": tool_definitions(), "nextCursor": None},
+                "result": {
+                    "tools": tool_definitions(
+                        include_auth_token=False,
+                        include_legacy_aliases=True,
+                    ),
+                    "nextCursor": None,
+                },
             }
 
         if method == "tools/call":
@@ -223,6 +266,7 @@ class MCPRequestHandler(BaseHTTPRequestHandler):
                 response = self._dispatch_tool(tool_name, arguments, conn, token)
                 response_bytes = json.dumps(response).encode("utf-8")
                 limiter.check_quota(token.name, count_chunks(response), len(response_bytes))
+                limiter.record_success(token.name, tool_name, count_chunks(response), len(response_bytes))
                 self._log_access(
                     tool=tool_name,
                     success=True,
@@ -233,6 +277,7 @@ class MCPRequestHandler(BaseHTTPRequestHandler):
                 content_result = _wrap_tool_result(response)
                 return {"jsonrpc": "2.0", "id": msg_id, "result": content_result}
             except ValueError as exc:
+                limiter.record_failure(token.name, tool_name)
                 self._log_access(
                     tool=tool_name,
                     success=False,
@@ -240,6 +285,8 @@ class MCPRequestHandler(BaseHTTPRequestHandler):
                 )
                 return _jsonrpc_error(payload, -32601, str(exc))
             except Exception as exc:  # pragma: no cover - safety net
+                limiter.record_failure(token.name, tool_name)
+                LOGGER.exception("Unhandled tool dispatch exception")
                 self._log_access(
                     tool=tool_name,
                     success=False,
@@ -258,7 +305,7 @@ class MCPRequestHandler(BaseHTTPRequestHandler):
             raise AuthError("Missing bearer token")
         token_value = header.split(" ", 1)[1]
         server_secret = resolve_server_secret(self.server.config)
-        if server_secret and token_value == server_secret:
+        if server_secret and hmac.compare_digest(token_value, server_secret):
             return TokenInfo(
                 name="admin",
                 token=None,
@@ -272,7 +319,7 @@ class MCPRequestHandler(BaseHTTPRequestHandler):
                 rate_limit_per_hour=0,
             )
         registration_token = _registration_token(self.server.config)
-        if registration_token and token_value == registration_token:
+        if registration_token and hmac.compare_digest(token_value, registration_token):
             return TokenInfo(
                 name="registrar",
                 token=None,
@@ -289,9 +336,11 @@ class MCPRequestHandler(BaseHTTPRequestHandler):
 
     def _dispatch_tool(self, tool: str, payload: Dict[str, Any], conn, token):
         if is_write_tool(tool):
-            return self.server.writer.submit(
+            result = self.server.writer.submit(
                 lambda writer_conn: dispatch_tool(tool, payload, writer_conn, self.server.config, token)
             )
+            self.server.note_write_activity()
+            return result
         return dispatch_tool(tool, payload, conn, self.server.config, token)
 
     def _log_access(
@@ -305,10 +354,10 @@ class MCPRequestHandler(BaseHTTPRequestHandler):
         bytes_returned: int = 0,
     ) -> None:
         writer = getattr(self.server, "writer", None)
-        if writer is None:
+        sink = getattr(self.server, "audit_sink", None)
+        if writer is None or sink is None:
             return
-        writer.submit(
-            log_access,
+        sink.submit(
             tool=tool,
             success=success,
             token_name=token_name,
@@ -328,6 +377,10 @@ class MCPRequestHandler(BaseHTTPRequestHandler):
     def log_message(self, format: str, *args) -> None:  # noqa: A003
         return
 
+    def _handle_metrics(self) -> None:
+        payload = self.server.metrics_snapshot()
+        self._write_json(200, payload)
+
 
 class MCPServer(ThreadingHTTPServer):
     def __init__(self, server_address, request_handler_class, config_path: Path | None) -> None:
@@ -342,8 +395,75 @@ class MCPServer(ThreadingHTTPServer):
             retry_budget_ms=_int_or_default(db_cfg.get("retry_budget_ms"), 30000),
             retry_backoff_ms=min(_int_or_default(db_cfg.get("retry_backoff_ms"), 50), 500),
         )
+        audit_cfg = self.config.get("security", {}).get("audit", {})
+        self.audit_sink = AsyncAuditSink(
+            db_path=self.db_path,
+            queue_size=int(audit_cfg.get("queue_size", 10000) or 10000),
+        )
+        self._metrics_lock = threading.Lock()
+        self._metrics = {
+            "requests_total": 0,
+            "errors_total": 0,
+            "sse_clients": 0,
+        }
+        observability_cfg = self.config.get("observability", {})
+        self._wal_checkpoint_interval_seconds = int(
+            observability_cfg.get("wal_checkpoint_interval_seconds", 60) or 0
+        )
+        self._wal_truncate_idle_seconds = int(
+            observability_cfg.get("wal_truncate_idle_seconds", 300) or 0
+        )
+        self._last_checkpoint_at = 0.0
+        self._last_write_at = time.time()
+        self._checkpoint_lock = threading.Lock()
         self.worker = Worker(db_path=self.db_path, config=self.config, writer=self.writer)
         super().__init__(server_address, request_handler_class)
+
+    def note_request(self) -> None:
+        with self._metrics_lock:
+            self._metrics["requests_total"] += 1
+
+    def note_error(self) -> None:
+        with self._metrics_lock:
+            self._metrics["errors_total"] += 1
+
+    def note_sse_change(self, *, delta: int) -> None:
+        with self._metrics_lock:
+            self._metrics["sse_clients"] = max(0, self._metrics["sse_clients"] + delta)
+
+    def note_write_activity(self) -> None:
+        self._last_write_at = time.time()
+
+    def maybe_checkpoint(self) -> None:
+        interval = self._wal_checkpoint_interval_seconds
+        if interval <= 0:
+            return
+        now = time.time()
+        if now - self._last_checkpoint_at < interval:
+            return
+        with self._checkpoint_lock:
+            now = time.time()
+            if now - self._last_checkpoint_at < interval:
+                return
+            conn = connect(self.db_path)
+            try:
+                conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
+                if (
+                    self._wal_truncate_idle_seconds > 0
+                    and (now - self._last_write_at) >= self._wal_truncate_idle_seconds
+                ):
+                    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            finally:
+                conn.close()
+                self._last_checkpoint_at = now
+
+    def metrics_snapshot(self) -> Dict[str, Any]:
+        with self._metrics_lock:
+            data = dict(self._metrics)
+        data["writer_queue_depth"] = self.writer.queue_depth()
+        data["audit_queue_depth"] = self.audit_sink.queue_depth()
+        data["audit_dropped_total"] = self.audit_sink.dropped_count()
+        return data
 
 
 def _check_no_other_server(db_path: Path) -> ServerSingletonLock:
@@ -367,10 +487,11 @@ def run_server(
     stop_event: threading.Event | None = None,
 ) -> None:
     server = MCPServer((host, port), MCPRequestHandler, config_path)
+    configure_logging(server.config)
     background = BackgroundSync(
         config=server.config,
         config_path=config_path,
-        log=click.echo,
+        log=lambda message: LOGGER.info("%s", message),
         write_submit=server.writer,
     )
 
@@ -378,6 +499,8 @@ def run_server(
     worker_started = False
     background_started = False
     try:
+        # Fail fast if the writer thread could not open its DB connection.
+        server.writer.submit(lambda conn: None)
         # Hold an exclusive advisory lock for the server's entire lifetime so
         # that a second ``hoard serve`` on the same DB is rejected immediately.
         server_lock = _check_no_other_server(server.db_path)
@@ -391,8 +514,8 @@ def run_server(
                 latest = max(migrations.keys()) if migrations else 0
                 current = get_current_version(conn)
                 if current < latest:
-                    click.echo(f"⚠️  Schema migrations pending (v{current} → v{latest})")
-                    click.echo("   Run 'hoard db migrate' or restart without --no-migrate")
+                    LOGGER.warning("Schema migrations pending (v%s -> v%s)", current, latest)
+                    LOGGER.warning("Run 'hoard db migrate' or restart without --no-migrate")
             else:
                 migrate(conn, app_version=__version__)
             _bootstrap_tokens(conn, server.config)
@@ -414,6 +537,7 @@ def run_server(
             background.stop()
         if worker_started:
             server.worker.stop()
+        server.audit_sink.stop()
         server.writer.stop()
         server.server_close()
         if server_lock is not None:

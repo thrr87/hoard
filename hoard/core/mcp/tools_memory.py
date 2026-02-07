@@ -16,7 +16,7 @@ from hoard.core.memory.v2.store import (
     memory_supersede,
     memory_write,
 )
-from hoard.core.security.errors import ScopeError
+from hoard.core.mcp.scopes import require_any_scope
 
 
 TOOL_DEFINITIONS: List[Dict[str, Any]] = [
@@ -399,12 +399,16 @@ def dispatch_tool(tool: str, arguments: Dict[str, Any], conn, config: Dict[str, 
 
 
 def _require_read(token) -> None:
-    if any(scope in token.scopes for scope in {"memory", "memory.read", "memory.write"}):
-        return
-    raise ScopeError("Missing scopes: memory.read")
+    require_any_scope(
+        token,
+        {"memory", "memory.read", "memory.write"},
+        message="Missing scopes: memory.read",
+    )
 
 
 def _require_write(token) -> None:
-    if any(scope in token.scopes for scope in {"memory", "memory.write"}):
-        return
-    raise ScopeError("Missing scopes: memory.write")
+    require_any_scope(
+        token,
+        {"memory", "memory.write"},
+        message="Missing scopes: memory.write",
+    )

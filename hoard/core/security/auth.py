@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hmac
 from dataclasses import dataclass
 from typing import Iterable, List, Optional, Set
 
@@ -68,7 +69,7 @@ def authenticate_token(token_value: str, config: dict, conn=None) -> TokenInfo:
             pass
 
     for token in load_tokens(config):
-        if token.token == token_value:
+        if token.token and hmac.compare_digest(token.token, token_value):
             return token
     raise AuthError("Invalid token")
 

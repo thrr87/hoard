@@ -24,8 +24,10 @@ from pathlib import Path
 from types import TracebackType
 from typing import Optional, Type
 
+from hoard.core.errors import HoardError
 
-class DatabaseLockError(Exception):
+
+class DatabaseLockError(HoardError):
     """Raised when a lock cannot be acquired."""
 
 

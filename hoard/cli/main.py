@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import ipaddress
+import hashlib
 import json
 import os
 import secrets
 import shutil
 import signal
+import sqlite3
 import socket
 import subprocess
 import sys
@@ -36,6 +38,7 @@ from hoard.core.config import (
     resolve_paths,
     save_config,
 )
+from hoard.core.db.lock import DatabaseLockError, ServerSingletonLock
 from hoard.core.db.connection import connect, initialize_db, write_locked
 from hoard.core.embeddings.model import EmbeddingError, EmbeddingModel
 from hoard.core.mcp.server import run_server
@@ -77,6 +80,18 @@ def _int_or_default(value: object, default: int) -> int:
     except (TypeError, ValueError):
         return default
     return parsed if parsed > 0 else default
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _checksum_path(backup_path: Path) -> Path:
+    return Path(f"{backup_path}.sha256")
 
 
 def _server_base_url(config: dict) -> str:
@@ -568,6 +583,87 @@ def db_verify_command(deep: bool, config_path: Path | None) -> None:
             console.print(f"[red]✗[/red] SQLite integrity_check: {result}")
 
     conn.close()
+
+
+@db_group.command("backup")
+@click.argument("path", type=click.Path(path_type=Path))
+@click.option("--config", "config_path", type=click.Path(path_type=Path))
+def db_backup_command(path: Path, config_path: Path | None) -> None:
+    """Create a consistent SQLite backup and checksum sidecar."""
+    config = load_config(config_path)
+    paths = resolve_paths(config, config_path)
+    db_path = paths.db_path
+    backup_path = path.expanduser().resolve()
+    backup_path.parent.mkdir(parents=True, exist_ok=True)
+    checksum_path = _checksum_path(backup_path)
+
+    busy_timeout_ms, lock_timeout_ms = _write_db_timeouts(config)
+    with write_locked(
+        db_path,
+        busy_timeout_ms=busy_timeout_ms,
+        lock_timeout_ms=lock_timeout_ms,
+    ) as source_conn:
+        source_conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
+        destination = sqlite3.connect(str(backup_path))
+        try:
+            source_conn.backup(destination)
+        finally:
+            destination.close()
+
+    digest = _sha256_file(backup_path)
+    checksum_path.write_text(f"{digest}\n")
+    console.print(f"Backup written: {backup_path}")
+    console.print(f"Checksum written: {checksum_path}")
+
+
+@db_group.command("restore")
+@click.argument("path", type=click.Path(path_type=Path, exists=True))
+@click.option("--force", is_flag=True, default=False, help="Overwrite current database.")
+@click.option("--config", "config_path", type=click.Path(path_type=Path))
+def db_restore_command(path: Path, force: bool, config_path: Path | None) -> None:
+    """Restore a SQLite backup created by `hoard db backup`."""
+    if not force:
+        raise click.ClickException("Refusing to restore without --force.")
+
+    backup_path = path.expanduser().resolve()
+    checksum_path = _checksum_path(backup_path)
+    if checksum_path.exists():
+        expected = checksum_path.read_text().strip().split()[0]
+        actual = _sha256_file(backup_path)
+        if expected != actual:
+            raise click.ClickException(
+                f"Checksum mismatch for {backup_path}. Expected {expected}, got {actual}."
+            )
+
+    config = load_config(config_path)
+    paths = resolve_paths(config, config_path)
+    db_path = paths.db_path
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+
+    singleton_lock = ServerSingletonLock(db_path)
+    if not singleton_lock.try_acquire():
+        raise click.ClickException(
+            "Cannot restore while `hoard serve` is running for this database. Stop it first."
+        )
+
+    busy_timeout_ms, lock_timeout_ms = _write_db_timeouts(config)
+    try:
+        with write_locked(
+            db_path,
+            busy_timeout_ms=busy_timeout_ms,
+            lock_timeout_ms=lock_timeout_ms,
+        ) as destination_conn:
+            source = sqlite3.connect(str(backup_path))
+            try:
+                source.backup(destination_conn)
+            finally:
+                source.close()
+    except DatabaseLockError as exc:
+        raise click.ClickException(str(exc)) from exc
+    finally:
+        singleton_lock.release()
+
+    console.print(f"Database restored from: {backup_path}")
 
 
 @cli.group("memory")

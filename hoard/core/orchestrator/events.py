@@ -4,10 +4,11 @@ import json
 import uuid
 from typing import Any, Dict, List, Optional
 
+from hoard.core.errors import HoardError
 from hoard.core.orchestrator.utils import dumps, now_iso
 
 
-class EventError(Exception):
+class EventError(HoardError):
     pass
 
 

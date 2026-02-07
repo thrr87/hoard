@@ -2,17 +2,9 @@ from __future__ import annotations
 
 from typing import Any, Dict, Iterable, List, Optional
 
-from hoard.core.embeddings.model import EmbeddingError, EmbeddingModel
+from hoard.core.memory.model_cache import get_sentence_transformer
 from hoard.core.search.bm25 import search_chunks_flat
 from hoard.core.search.vector import vector_search
-
-_model_cache: dict[str, EmbeddingModel] = {}
-
-
-def _get_model(model_name: str) -> EmbeddingModel:
-    if model_name not in _model_cache:
-        _model_cache[model_name] = EmbeddingModel(model_name)
-    return _model_cache[model_name]
 
 
 def hybrid_search(
@@ -36,11 +28,13 @@ def hybrid_search(
     vectors_enabled = bool(vectors_config.get("enabled", False))
     model_name = vectors_config.get("model_name", "sentence-transformers/all-MiniLM-L6-v2")
     prefilter_limit = int(vectors_config.get("prefilter_limit", 1000))
-
-    total_chunks = _count_chunks(conn, source, allow_sensitive)
-    use_prefilter = vectors_enabled and total_chunks > 50_000
-
-    bm25_limit = prefilter_limit if use_prefilter else max(limit * 20, 200)
+    candidate_limit = int(
+        search_config.get("vector_candidate_limit")
+        or vectors_config.get("candidate_limit")
+        or prefilter_limit
+        or 1000
+    )
+    bm25_limit = max(limit * 20, candidate_limit, 200)
     bm25_results = search_chunks_flat(
         conn,
         query,
@@ -52,27 +46,30 @@ def hybrid_search(
     bm25_rank = {row["chunk_id"]: idx + 1 for idx, row in enumerate(bm25_results)}
     bm25_scores = {row["chunk_id"]: row["score"] for row in bm25_results}
 
-    candidate_ids = [row["chunk_id"] for row in bm25_results] if use_prefilter else None
+    candidate_ids = [row["chunk_id"] for row in bm25_results[:candidate_limit]]
 
     vector_rank: dict[str, int] = {}
     vector_scores: dict[str, float] = {}
 
     if vectors_enabled:
         try:
-            model = _get_model(model_name)
-            query_vector = model.encode([query])[0]
+            model = get_sentence_transformer(model_name)
+            query_vector = model.encode([query], normalize_embeddings=True)[0]
             vector_results = vector_search(
                 conn,
                 query_vector=query_vector,
                 model_name=model_name,
-                limit=bm25_limit,
+                limit=min(bm25_limit, candidate_limit),
                 candidate_chunk_ids=candidate_ids,
                 source=source,
                 allow_sensitive=allow_sensitive,
+                max_candidates=candidate_limit,
+                ann_enabled=bool(vectors_config.get("ann", {}).get("enabled", False)),
+                ann_config=vectors_config.get("ann", {}),
             )
             vector_rank = {row["chunk_id"]: idx + 1 for idx, row in enumerate(vector_results)}
             vector_scores = {row["chunk_id"]: row["score"] for row in vector_results}
-        except EmbeddingError:
+        except Exception:
             vectors_enabled = False
 
     scores: dict[str, float] = {}
@@ -128,30 +125,6 @@ def hybrid_search(
                 break
 
     return list(grouped.values())[:limit]
-
-
-def _count_chunks(conn, source: str | None, allow_sensitive: bool) -> int:
-    filters = ["entities.tombstoned_at IS NULL"]
-    params: List[Any] = []
-    if source:
-        filters.append("entities.source = ?")
-        params.append(source)
-    if not allow_sensitive:
-        filters.append("entities.sensitivity NOT IN ('sensitive', 'secret')")
-
-    where_clause = " AND ".join(filters)
-    row = conn.execute(
-        f"""
-        SELECT COUNT(*)
-        FROM chunks
-        JOIN entities ON entities.id = chunks.entity_id
-        WHERE {where_clause}
-        """,
-        params,
-    ).fetchone()
-    return int(row[0]) if row else 0
-
-
 def _fetch_chunk_details(conn, chunk_ids: Iterable[str]) -> Dict[str, Dict[str, Any]]:
     ids = list(chunk_ids)
     if not ids:

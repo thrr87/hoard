@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from array import array
+import sqlite3
 from typing import Iterable, List, Optional, Tuple
 
 from hoard.core.embeddings.model import EmbeddingModel
@@ -49,6 +50,7 @@ def build_embeddings(
             total += 1
 
         conn.commit()
+        _mark_ann_stale(conn, model.model_name)
 
     return total
 
@@ -86,3 +88,28 @@ def _iter_missing_chunks(
             break
 
         yield rows
+
+
+def _mark_ann_stale(conn, model_name: str) -> None:
+    try:
+        count_row = conn.execute(
+            "SELECT COUNT(*) AS total FROM embeddings WHERE model = ?",
+            (model_name,),
+        ).fetchone()
+        vectors_count = int(count_row["total"]) if count_row else 0
+        conn.execute(
+            """
+            INSERT INTO ann_index_meta (id, backend, model_name, vectors_count, updated_at, state)
+            VALUES (1, 'hnsw', ?, ?, datetime('now'), 'stale')
+            ON CONFLICT(id) DO UPDATE SET
+                model_name = excluded.model_name,
+                vectors_count = excluded.vectors_count,
+                updated_at = excluded.updated_at,
+                state = 'stale'
+            """,
+            (model_name, vectors_count),
+        )
+        conn.commit()
+    except sqlite3.OperationalError:
+        # Table is available only after migration 008.
+        return

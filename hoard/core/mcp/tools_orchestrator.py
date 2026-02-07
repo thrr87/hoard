@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import Any, Dict, List
 
+from hoard.core.mcp.scopes import require_any_scope
 from hoard.core.orchestrator import (
     artifact_get,
     artifact_list,
@@ -35,7 +36,6 @@ from hoard.core.orchestrator import (
     cancel_workflow,
     update_agent_capabilities,
 )
-from hoard.core.security.errors import ScopeError
 
 
 TOOL_DEFINITIONS: List[Dict[str, Any]] = [
@@ -319,6 +319,7 @@ TOOL_DEFINITIONS: List[Dict[str, Any]] = [
 
 WRITE_TOOLS = {
     "agent.register",
+    "agent.heartbeat",
     "agent.capabilities",
     "agent.deregister",
     "task.create",
@@ -622,11 +623,7 @@ def dispatch_tool(tool: str, arguments: Dict[str, Any], conn, config: Dict[str, 
 
 
 def _require_any(token, scopes: set[str]) -> None:
-    if "admin" in token.scopes:
-        return
-    if any(scope in token.scopes for scope in scopes):
-        return
-    raise ScopeError(f"Missing scopes: {', '.join(sorted(scopes))}")
+    require_any_scope(token, scopes)
 
 
 def _task_args(arguments: Dict[str, Any]) -> Dict[str, Any]:

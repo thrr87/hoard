@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 from typing import Any, Dict, Optional
 
+from hoard.core.security.limits import record_audit_event
+
 
 def log_access(
     conn,
@@ -14,6 +16,7 @@ def log_access(
     chunks_returned: int = 0,
     bytes_returned: int = 0,
     metadata: Optional[Dict[str, Any]] = None,
+    update_rate_limits: bool = True,
 ) -> None:
     payload = json.dumps(metadata) if metadata else None
     conn.execute(
@@ -33,3 +36,10 @@ def log_access(
         ),
     )
     conn.commit()
+    if update_rate_limits:
+        record_audit_event(
+            token_name,
+            tool,
+            chunks_returned=chunks_returned,
+            bytes_returned=bytes_returned,
+        )

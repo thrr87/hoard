@@ -68,12 +68,17 @@ def test_http_mcp_tools_list_and_search(tmp_path: Path, mcp_server) -> None:
         status, resp = _call_mcp(url, "hoard_sk_test", "tools/list", {})
         assert status == 200
         assert resp["result"]["tools"]
+        tool_map = {tool["name"]: tool for tool in resp["result"]["tools"]}
+        assert "data.search" in tool_map
+        assert "search" in tool_map
+        assert tool_map["search"].get("deprecated") is True
+        assert "token" not in tool_map["data.search"]["inputSchema"]["properties"]
 
         _, search = _call_mcp(
             url,
             "hoard_sk_test",
             "tools/call",
-            {"name": "search", "arguments": {"query": "Hoard", "limit": 1}},
+            {"name": "data.search", "arguments": {"query": "Hoard", "limit": 1}},
         )
         content = json.loads(search["result"]["content"][0]["text"])
         assert content["results"]

@@ -3,16 +3,21 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import re
 import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from hoard.core.config import default_data_path
+from hoard.core.errors import HoardError
 from hoard.core.orchestrator.utils import dumps, now_iso
 
 
-class ArtifactError(Exception):
+class ArtifactError(HoardError):
     pass
+
+
+_SAFE_ARTIFACT_NAME_RE = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
 
 
 def artifact_put(
@@ -36,6 +41,7 @@ def artifact_put(
     if not artifact_type:
         raise ArtifactError("artifact_type is required")
 
+    safe_name = _sanitize_artifact_name(name)
     blob_root_value = config.get("artifacts", {}).get("blob_path")
     blob_root = Path(blob_root_value).expanduser() if blob_root_value else default_data_path("artifacts")
     inline_max = int(config.get("artifacts", {}).get("inline_max_bytes", 262_144))
@@ -56,8 +62,10 @@ def artifact_put(
     elif content_bytes is not None:
         artifact_dir = blob_root / f"art-{content_hash}"
         artifact_dir.mkdir(parents=True, exist_ok=True)
-        blob_name = f"{name}"
+        blob_name = safe_name
         path = artifact_dir / blob_name
+        if not path.resolve().is_relative_to(artifact_dir.resolve()):
+            raise ArtifactError("Invalid artifact name")
         path.write_bytes(content_bytes)
         content_blob_path = str(path)
 
@@ -73,7 +81,7 @@ def artifact_put(
             artifact_id,
             task_id,
             artifact_type,
-            name,
+            safe_name,
             content_text,
             content_blob_path,
             content_url,
@@ -90,7 +98,7 @@ def artifact_put(
         "artifact_id": artifact_id,
         "task_id": task_id,
         "artifact_type": artifact_type,
-        "name": name,
+        "name": safe_name,
         "content_hash": content_hash,
         "size_bytes": size_bytes,
         "content_blob_path": content_blob_path,
@@ -169,3 +177,16 @@ def _row_to_dict(row) -> Dict[str, Any]:
         "role": row["role"],
         "created_at": row["created_at"],
     }
+
+
+def _sanitize_artifact_name(name: str) -> str:
+    value = name.strip()
+    if not value:
+        raise ArtifactError("name is required")
+    if "/" in value or "\\" in value or ".." in value or Path(value).is_absolute():
+        raise ArtifactError("Invalid artifact name")
+    if not _SAFE_ARTIFACT_NAME_RE.fullmatch(value):
+        raise ArtifactError(
+            "Invalid artifact name (allowed: letters, numbers, ., _, -, length 1-128)"
+        )
+    return value

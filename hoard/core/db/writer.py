@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import queue
 import sqlite3
 import threading
@@ -10,6 +11,8 @@ from typing import Any, Callable
 
 from hoard.core.db.connection import connect
 from hoard.core.db.lock import DatabaseLockError, DatabaseWriteLock
+
+LOGGER = logging.getLogger(__name__)
 
 
 @dataclass
@@ -45,6 +48,9 @@ class WriteCoordinator:
         self._retry_budget_ms = _int_or_default(retry_budget_ms, 30000)
         self._retry_backoff_ms = min(_int_or_default(retry_backoff_ms, 50), 500)
         self._thread_id: int | None = None
+        self._conn = None
+        self._startup_error: Exception | None = None
+        self._started = threading.Event()
         self._lock = DatabaseWriteLock(
             db_path,
             timeout_seconds=self._lock_timeout_ms / 1000,
@@ -52,23 +58,40 @@ class WriteCoordinator:
         self._thread.start()
 
     def submit(self, fn: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
+        self._await_startup()
         if threading.get_ident() == self._thread_id:
+            if self._conn is None:
+                raise RuntimeError("WriteCoordinator is not available")
             return fn(self._conn, *args, **kwargs)
 
         task = _WriteTask(fn=fn, args=args, kwargs=kwargs, event=threading.Event())
         self._queue.put(task)
-        task.event.wait()
+        while not task.event.wait(timeout=0.5):
+            if not self._thread.is_alive():
+                raise RuntimeError("WriteCoordinator thread stopped unexpectedly")
         if task.error:
             raise task.error
         return task.result
 
     def stop(self) -> None:
+        if self._thread_id is None and self._startup_error is not None:
+            return
         self._queue.put(None)
         self._thread.join(timeout=5)
 
+    def queue_depth(self) -> int:
+        return self._queue.qsize()
+
     def _run(self) -> None:
         self._thread_id = threading.get_ident()
-        self._conn = connect(self._db_path, busy_timeout_ms=self._busy_timeout_ms)
+        try:
+            self._conn = connect(self._db_path, busy_timeout_ms=self._busy_timeout_ms)
+        except Exception as exc:  # pragma: no cover - startup failure path
+            LOGGER.exception("WriteCoordinator failed to start")
+            self._startup_error = exc
+            self._started.set()
+            return
+        self._started.set()
         while True:
             task = self._queue.get()
             if task is None:
@@ -78,6 +101,7 @@ class WriteCoordinator:
             except Exception as exc:
                 # Defensive safety net: report task failures and keep
                 # the writer loop alive for subsequent tasks.
+                LOGGER.exception("Write task failed")
                 task.error = exc
             finally:
                 task.event.set()
@@ -86,6 +110,13 @@ class WriteCoordinator:
             self._conn.close()
         except Exception:
             pass
+
+    def _await_startup(self) -> None:
+        self._started.wait()
+        if self._startup_error is not None:
+            raise RuntimeError(
+                f"WriteCoordinator startup failed: {self._startup_error}"
+            ) from self._startup_error
 
     def _run_task_with_retry(self, task: _WriteTask) -> None:
         deadline = time.monotonic() + (self._retry_budget_ms / 1000)

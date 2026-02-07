@@ -4,12 +4,13 @@ import json
 import uuid
 from typing import Any, Dict, Iterable, List, Optional
 
+from hoard.core.errors import HoardError
 from hoard.core.orchestrator.events import publish_event
 from hoard.core.orchestrator.utils import dumps, now_iso
 from hoard.core.orchestrator.workflows import on_task_completion
 
 
-class TaskError(Exception):
+class TaskError(HoardError):
     pass
 
 

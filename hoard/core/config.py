@@ -9,6 +9,8 @@ from typing import Any, Dict
 
 import yaml
 
+from hoard.core.config_schema import validate_config
+
 DEFAULT_CONFIG = {
     "security": {
         "tokens": [],
@@ -71,6 +73,7 @@ DEFAULT_CONFIG = {
     "search": {
         "rrf_k": 60,
         "max_chunks_per_entity": 3,
+        "vector_candidate_limit": 2000,
     },
     "server": {
         "host": "127.0.0.1",
@@ -82,6 +85,14 @@ DEFAULT_CONFIG = {
         "model_name": "sentence-transformers/all-MiniLM-L6-v2",
         "batch_size": 32,
         "prefilter_limit": 1000,
+        "candidate_limit": 2000,
+        "ann": {
+            "enabled": False,
+            "backend": "hnsw",
+            "ef_search": 64,
+            "m": 16,
+            "ef_construction": 200,
+        },
     },
     "write": {
         "enabled": True,
@@ -117,7 +128,7 @@ DEFAULT_CONFIG = {
             "max_ttl_days": 30,
         },
         "limits": {
-            "global": {"max_memories": 50000},
+            "global": {"max_memories": 50000, "max_content_bytes": 262144},
             "per_agent": {"max_writes_per_hour": 100},
             "retention": {
                 "default_ttl_days": 365,
@@ -151,7 +162,20 @@ DEFAULT_CONFIG = {
             "slot_match_bonus": 0.1,
             "slot_only_baseline": 0.5,
             "union_multiplier": 2,
+            "vector_candidate_limit": 2000,
         },
+    },
+    "mcp": {
+        "stdio": {
+            "allow_writes": False,
+        }
+    },
+    "observability": {
+        "log_format": "json",
+        "log_level": "INFO",
+        "metrics_enabled": True,
+        "wal_checkpoint_interval_seconds": 60,
+        "wal_truncate_idle_seconds": 300,
     },
     "artifacts": {
         "blob_path": "~/.hoard/artifacts",
@@ -291,12 +315,20 @@ def load_config(path: Path | None = None) -> Dict[str, Any]:
     config_path = path or get_default_config_path()
     if not config_path.exists():
         base = copy.deepcopy(DEFAULT_CONFIG)
-        return _expand_config_paths(_apply_data_dir_defaults(base, {}))
+        candidate = _expand_config_paths(_apply_data_dir_defaults(base, {}))
+        try:
+            return validate_config(candidate)
+        except ValueError as exc:
+            raise ValueError(f"Invalid config at {config_path}: {exc}") from exc
 
     data = yaml.safe_load(config_path.read_text()) or {}
     merged = _deep_merge(copy.deepcopy(DEFAULT_CONFIG), data)
     merged = _apply_data_dir_defaults(merged, data)
-    return _expand_config_paths(merged)
+    candidate = _expand_config_paths(merged)
+    try:
+        return validate_config(candidate)
+    except ValueError as exc:
+        raise ValueError(f"Invalid config at {config_path}: {exc}") from exc
 
 
 def ensure_config_file(path: Path | None = None) -> Path:

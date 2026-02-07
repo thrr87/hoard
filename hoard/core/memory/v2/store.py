@@ -3,23 +3,29 @@ from __future__ import annotations
 import json
 import re
 import uuid
-from datetime import datetime, timedelta
+from datetime import timedelta
 from typing import Any, Dict, Iterable, List, Optional
 
+from hoard.core.errors import HoardError
 from hoard.core.memory.predicates import active_memory_conditions
-from hoard.core.search.bm25 import _sanitize_fts_query
+from hoard.core.memory.v2.fts import sanitize_fts_query
 from hoard.core.security.auth import TokenInfo
+from hoard.core.time import utc_now, utc_now_iso
 
 
 from hoard.core.memory.model_cache import get_sentence_transformer
 
 
-class MemoryError(Exception):
+class HoardMemoryError(HoardError):
     pass
 
 
+# Backward-compat alias for callers importing MemoryError.
+MemoryError = HoardMemoryError
+
+
 def _now_iso() -> str:
-    return datetime.utcnow().isoformat(timespec="seconds")
+    return utc_now_iso(timespec="seconds")
 
 
 def _parse_json(value: str | None) -> Any:
@@ -113,7 +119,7 @@ def _check_and_update_rate_limit(conn, agent: TokenInfo, config: dict) -> None:
     limit = int(agent.rate_limit_per_hour or 0)
     if limit <= 0:
         return
-    window_start = datetime.utcnow().replace(minute=0, second=0, microsecond=0).isoformat()
+    window_start = utc_now().replace(minute=0, second=0, microsecond=0).isoformat()
     row = conn.execute(
         """
         SELECT write_count FROM agent_rate_limits
@@ -139,6 +145,36 @@ def _check_and_update_rate_limit(conn, agent: TokenInfo, config: dict) -> None:
             """,
             (agent.name, window_start),
         )
+
+
+def _enforce_memory_limits(conn, *, content: str, config: dict, creating: bool) -> None:
+    limits_cfg = config.get("write", {}).get("limits", {}).get("global", {})
+
+    max_content_bytes = int(limits_cfg.get("max_content_bytes", 0) or 0)
+    if max_content_bytes > 0:
+        content_size = len(content.encode("utf-8"))
+        if content_size > max_content_bytes:
+            raise MemoryError(
+                f"Memory content too large ({content_size} bytes > {max_content_bytes} bytes)"
+            )
+
+    if not creating:
+        return
+
+    max_memories = int(limits_cfg.get("max_memories", 0) or 0)
+    if max_memories <= 0:
+        return
+    row = conn.execute(
+        """
+        SELECT COUNT(*) AS total
+        FROM memories
+        WHERE retracted_at IS NULL
+          AND superseded_at IS NULL
+        """
+    ).fetchone()
+    total = int(row["total"]) if row else 0
+    if total >= max_memories:
+        raise MemoryError(f"Global memory limit reached ({max_memories})")
 
 
 def memory_write(
@@ -187,6 +223,7 @@ def memory_write(
 
     if agent:
         _check_and_update_rate_limit(conn, agent, config)
+    _enforce_memory_limits(conn, content=content, config=config, creating=True)
 
     conn.execute(
         """
@@ -239,6 +276,159 @@ def memory_write(
             )
 
     _insert_event(conn, memory_id=memory_id, event_type="created", actor=actor or source_agent)
+
+    _enqueue_job(conn, job_type="embed_memory", memory_id=memory_id, priority=10)
+    _enqueue_job(conn, job_type="detect_duplicates", memory_id=memory_id, priority=0)
+    _enqueue_job(conn, job_type="detect_conflicts", memory_id=memory_id, priority=0)
+
+    return {
+        "id": memory_id,
+        "content": content,
+        "memory_type": memory_type,
+        "slot": slot,
+        "scope_type": scope_type,
+        "scope_id": scope_id,
+        "source_agent": source_agent,
+        "source_agent_version": source_agent_version,
+        "source_session_id": source_session_id,
+        "source_conversation_id": source_conversation_id,
+        "source_context": source_context,
+        "created_at": now,
+        "expires_at": expires_at,
+        "sensitivity": sensitivity,
+        "tags": tags_norm,
+        "relations": relations or [],
+    }
+
+
+def memory_upsert(
+    conn,
+    *,
+    memory_id: str,
+    content: str,
+    memory_type: str,
+    scope_type: str,
+    scope_id: Optional[str],
+    source_agent: str,
+    source_agent_version: Optional[str] = None,
+    source_session_id: Optional[str] = None,
+    source_conversation_id: Optional[str] = None,
+    source_context: Optional[str] = None,
+    slot: Optional[str] = None,
+    tags: Optional[Iterable[str]] = None,
+    relations: Optional[Iterable[dict]] = None,
+    expires_at: Optional[str] = None,
+    sensitivity: str = "normal",
+    actor: Optional[str] = None,
+    agent: Optional[TokenInfo] = None,
+    config: Optional[dict] = None,
+) -> Dict[str, Any]:
+    if not memory_id:
+        raise MemoryError("memory_id is required")
+    if not content:
+        raise MemoryError("Memory content is required")
+    if not memory_type:
+        raise MemoryError("memory_type is required")
+    if not scope_type:
+        raise MemoryError("scope_type is required")
+    if not source_agent:
+        raise MemoryError("source_agent is required")
+
+    config = config or {}
+    _validate_slot(slot, config)
+
+    if scope_type == "user":
+        scope_id = None
+    elif not scope_id:
+        raise MemoryError("scope_id required for non-user scope")
+
+    tags_norm = _normalize_tags(tags)
+    now = _now_iso()
+
+    if agent:
+        _check_and_update_rate_limit(conn, agent, config)
+
+    existing = conn.execute("SELECT 1 FROM memories WHERE id = ?", (memory_id,)).fetchone()
+    _enforce_memory_limits(conn, content=content, config=config, creating=existing is None)
+
+    if existing is None:
+        return memory_write(
+            conn,
+            memory_id=memory_id,
+            content=content,
+            memory_type=memory_type,
+            scope_type=scope_type,
+            scope_id=scope_id,
+            source_agent=source_agent,
+            source_agent_version=source_agent_version,
+            source_session_id=source_session_id,
+            source_conversation_id=source_conversation_id,
+            source_context=source_context,
+            slot=slot,
+            tags=tags_norm,
+            relations=relations,
+            expires_at=expires_at,
+            sensitivity=sensitivity,
+            actor=actor,
+            agent=agent,
+            config=config,
+        )
+
+    conn.execute(
+        """
+        UPDATE memories
+        SET content = ?,
+            memory_type = ?,
+            slot = ?,
+            scope_type = ?,
+            scope_id = ?,
+            source_agent = ?,
+            source_agent_version = ?,
+            source_session_id = ?,
+            source_conversation_id = ?,
+            source_context = ?,
+            expires_at = ?,
+            sensitivity = ?
+        WHERE id = ?
+        """,
+        (
+            content,
+            memory_type,
+            slot,
+            scope_type,
+            scope_id,
+            source_agent,
+            source_agent_version,
+            source_session_id,
+            source_conversation_id,
+            source_context,
+            expires_at,
+            sensitivity,
+            memory_id,
+        ),
+    )
+    conn.execute(
+        "INSERT OR IGNORE INTO memory_counters (memory_id) VALUES (?)",
+        (memory_id,),
+    )
+    conn.execute("DELETE FROM memory_tags WHERE memory_id = ?", (memory_id,))
+    for tag in tags_norm:
+        conn.execute(
+            "INSERT INTO memory_tags (memory_id, tag) VALUES (?, ?)",
+            (memory_id, tag),
+        )
+    conn.execute("DELETE FROM memory_relations WHERE memory_id = ?", (memory_id,))
+    for relation in relations or []:
+        related_uri = relation.get("related_uri") if isinstance(relation, dict) else None
+        relation_type = relation.get("relation_type") if isinstance(relation, dict) else None
+        if related_uri:
+            conn.execute(
+                """
+                INSERT INTO memory_relations (memory_id, related_uri, relation_type)
+                VALUES (?, ?, ?)
+                """,
+                (memory_id, related_uri, relation_type or "related"),
+            )
 
     _enqueue_job(conn, job_type="embed_memory", memory_id=memory_id, priority=10)
     _enqueue_job(conn, job_type="detect_duplicates", memory_id=memory_id, priority=0)
@@ -351,7 +541,7 @@ def memory_propose(
     config: dict,
     ttl_days: Optional[int] = None,
 ) -> Dict[str, Any]:
-    now = datetime.utcnow()
+    now = utc_now()
     max_days = int(config.get("write", {}).get("proposals", {}).get("max_ttl_days", 30))
     default_days = int(
         config.get("write", {}).get("proposals", {}).get("default_ttl_days", 7)
@@ -551,13 +741,17 @@ def memory_query(
             ORDER BY bm25(memories_fts)
             LIMIT ?
             """,
-            [_sanitize_fts_query(query), *base_params, *tag_params, union_limit * 5],
+            [sanitize_fts_query(query), *base_params, *tag_params, union_limit * 5],
         ).fetchall()
 
         fts_scores: dict[str, float] = {}
         if fts_rows:
-            fts_scores = {row["id"]: 1.0 / (1.0 + row["bm25_score"]) for row in fts_rows}
-            max_fts = max(fts_scores.values()) if fts_scores else 1.0
+            # SQLite bm25() returns smaller-is-better values (often negative);
+            # normalize by negating first so larger numbers are better.
+            fts_scores = {row["id"]: max(0.0, -float(row["bm25_score"])) for row in fts_rows}
+            max_fts = max(fts_scores.values()) if fts_scores else 0.0
+            if max_fts <= 0.0:
+                max_fts = 1.0
             for mem_id, score in fts_scores.items():
                 fts_scores[mem_id] = score / max_fts
 
@@ -575,15 +769,25 @@ def memory_query(
                 model = get_sentence_transformer(model_name)
                 query_vec = model.encode([query], normalize_embeddings=True)[0]
 
-                emb_rows = conn.execute(
-                    f"""
-                    SELECT e.memory_id, e.embedding, e.dimensions
-                    FROM memory_embeddings e
-                    JOIN memories m ON m.id = e.memory_id
-                    WHERE {where_clause}{tag_filter}
-                    """,
-                    [*base_params, *tag_params],
-                ).fetchall()
+                candidate_limit = int(
+                    config.get("search", {}).get("vector_candidate_limit")
+                    or config.get("write", {}).get("query", {}).get("vector_candidate_limit")
+                    or 2000
+                )
+                candidate_ids = [row["id"] for row in fts_rows[:candidate_limit]]
+                emb_rows = []
+                if candidate_ids:
+                    candidate_placeholders = ",".join("?" for _ in candidate_ids)
+                    emb_rows = conn.execute(
+                        f"""
+                        SELECT e.memory_id, e.embedding, e.dimensions
+                        FROM memory_embeddings e
+                        JOIN memories m ON m.id = e.memory_id
+                        WHERE {where_clause}{tag_filter}
+                          AND e.memory_id IN ({candidate_placeholders})
+                        """,
+                        [*base_params, *tag_params, *candidate_ids],
+                    ).fetchall()
 
                 vec_scores = {}
                 for row in emb_rows:
@@ -666,6 +870,18 @@ def _fetch_memories(conn, ids: List[str]) -> List[Dict[str, Any]]:
         ids,
     ).fetchall()
     row_map = {row["id"]: row for row in rows}
+    tag_rows = conn.execute(
+        f"""
+        SELECT memory_id, tag
+        FROM memory_tags
+        WHERE memory_id IN ({placeholders})
+        ORDER BY tag
+        """,
+        ids,
+    ).fetchall()
+    tag_map: dict[str, list[str]] = {}
+    for row in tag_rows:
+        tag_map.setdefault(row["memory_id"], []).append(row["tag"])
 
     results: list[Dict[str, Any]] = []
     for memory_id in ids:
@@ -673,10 +889,6 @@ def _fetch_memories(conn, ids: List[str]) -> List[Dict[str, Any]]:
         if not row:
             continue
         entry = _memory_row_to_dict(row)
-        tags = conn.execute(
-            "SELECT tag FROM memory_tags WHERE memory_id = ? ORDER BY tag",
-            (memory_id,),
-        ).fetchall()
-        entry["tags"] = [r[0] for r in tags]
+        entry["tags"] = tag_map.get(memory_id, [])
         results.append(entry)
     return results

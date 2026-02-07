@@ -2,15 +2,15 @@ from __future__ import annotations
 
 import json
 import uuid
-from datetime import datetime
 
 from hoard.core.ingest.hash import compute_content_hash
+from hoard.core.time import utc_now_naive_iso
 
 VERSION = 3
 
 
 def _now_iso() -> str:
-    return datetime.utcnow().isoformat(timespec="seconds")
+    return utc_now_naive_iso(timespec="seconds")
 
 
 def up(conn) -> None:

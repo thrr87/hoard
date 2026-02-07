@@ -3,18 +3,21 @@ from __future__ import annotations
 import hashlib
 import importlib
 import inspect
+import logging
 import pkgutil
 import sqlite3
 import time
-from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Tuple
 
-import click
+from hoard.core.time import utc_now_iso
 
 
 class MigrationError(Exception):
     pass
+
+
+LOGGER = logging.getLogger(__name__)
 
 
 def compute_checksum(migration_module) -> str:
@@ -99,7 +102,7 @@ def record_migration(
         (version, name, applied_at, app_version, duration_ms, checksum)
         VALUES (?, ?, ?, ?, ?, ?)
         """,
-        (version, name, datetime.utcnow().isoformat(), app_version, duration_ms, checksum),
+        (version, name, utc_now_iso(timespec="seconds"), app_version, duration_ms, checksum),
     )
 
 
@@ -122,11 +125,10 @@ def check_migration_integrity(
             if current_checksum and stored_checksum != current_checksum:
                 mismatches.append((version, name, stored_checksum, current_checksum))
                 if warn:
-                    click.echo(
+                    LOGGER.warning(
                         f"⚠️  Migration {version} ({name}) checksum mismatch!\n"
                         f"   DB was migrated by different code. Proceeding may be risky.\n"
-                        f"   Stored: {stored_checksum}, Current: {current_checksum}",
-                        err=True,
+                        f"   Stored: {stored_checksum}, Current: {current_checksum}"
                     )
     return mismatches
 
@@ -228,11 +230,10 @@ def migrate(
     if applied:
         fk_errors = conn.execute("PRAGMA foreign_key_check").fetchall()
         if fk_errors:
-            click.echo(
+            LOGGER.warning(
                 "⚠️  Foreign key violations detected after migrations!\n"
                 "   Run 'hoard db repair' to fix, or check migration logic.\n"
-                f"   Violations: {fk_errors[:5]}{'...' if len(fk_errors) > 5 else ''}",
-                err=True,
+                f"   Violations: {fk_errors[:5]}{'...' if len(fk_errors) > 5 else ''}"
             )
 
     return applied
