@@ -57,17 +57,22 @@ class WriteCoordinator:
             task = self._queue.get()
             if task is None:
                 break
-            with self._lock:
-                try:
-                    task.result = task.fn(self._conn, *task.args, **task.kwargs)
-                    if self._conn.in_transaction:
-                        self._conn.commit()
-                except Exception as exc:
-                    if self._conn.in_transaction:
-                        self._conn.rollback()
-                    task.error = exc
-                finally:
-                    task.event.set()
+            try:
+                with self._lock:
+                    try:
+                        task.result = task.fn(self._conn, *task.args, **task.kwargs)
+                        if self._conn.in_transaction:
+                            self._conn.commit()
+                    except Exception as exc:
+                        if self._conn.in_transaction:
+                            self._conn.rollback()
+                        task.error = exc
+            except Exception as exc:
+                # Lock acquisition itself failed -- report to caller
+                # instead of killing the writer thread.
+                task.error = exc
+            finally:
+                task.event.set()
 
         try:
             self._conn.close()

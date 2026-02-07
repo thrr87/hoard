@@ -5,6 +5,7 @@ Covers:
 - DatabaseWriteLock mutual exclusion across threads (simulating processes)
 - ServerSingletonLock prevents two servers on the same DB
 - WriteCoordinator acquires/releases the lock per write
+- WriteCoordinator resilience when lock is contended
 - write_locked() context manager
 - CLI and sync paths hold the lock during writes
 """
@@ -170,6 +171,53 @@ def test_write_coordinator_serialises_across_threads(tmp_path: Path) -> None:
 
     assert not errors, f"Errors: {errors}"
     assert len(results) == 20
+
+
+def test_write_coordinator_survives_lock_contention(tmp_path: Path) -> None:
+    """If another thread holds the flock, the WriteCoordinator must report
+    the error to the caller and keep running -- not deadlock or crash.
+
+    Regression test: previously, a DatabaseLockError from acquire() would
+    propagate past the task loop, killing the writer thread and leaving
+    all submit() callers hanging on event.wait() forever.
+    """
+    db_path = tmp_path / "test.db"
+    conn = connect(db_path)
+    initialize_db(conn)
+    conn.close()
+
+    writer = WriteCoordinator(db_path=db_path)
+
+    # Hold the flock from another fd (simulating BackgroundSync or CLI)
+    external_lock = DatabaseWriteLock(db_path)
+    external_lock.acquire()
+
+    # Submit a write -- should fail with DatabaseLockError, NOT hang
+    def _noop_write(conn):
+        pass
+
+    with pytest.raises(Exception):
+        writer.submit(_noop_write)
+
+    # Release the external lock
+    external_lock.release()
+
+    # Writer thread must still be alive -- a subsequent write should succeed
+    def _insert(conn):
+        conn.execute(
+            "INSERT OR REPLACE INTO memory_entries "
+            "(id, key, content, tags, tags_text, metadata, created_at, updated_at) "
+            "VALUES ('m1', 'k1', 'survived', '', '', '{}', datetime('now'), datetime('now'))"
+        )
+
+    writer.submit(_insert)
+    writer.stop()
+
+    conn = connect(db_path)
+    row = conn.execute("SELECT content FROM memory_entries WHERE key = 'k1'").fetchone()
+    conn.close()
+    assert row is not None
+    assert row["content"] == "survived"
 
 
 # ---------------------------------------------------------------------------

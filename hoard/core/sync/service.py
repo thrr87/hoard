@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from hoard.core.config import default_data_path, resolve_paths
-from hoard.core.db.connection import connect, initialize_db, write_locked
+from hoard.core.db.connection import connect, initialize_db
 from hoard.core.ingest.registry import iter_enabled_connectors
 from hoard.core.ingest.sync import sync_connector
 from hoard.core.memory.store import memory_prune
@@ -61,10 +61,23 @@ def run_sync_with_lock(
     source: Optional[str] = None,
     lock_path: Optional[Path] = None,
 ) -> Dict[str, Any]:
+    """Run a sync, acquiring the file-based sync lock to prevent overlaps.
+
+    NOTE: This function is called both from the CLI (standalone process) and
+    from ``BackgroundSync`` (inside the ``hoard serve`` process).  It must
+    **not** hold a ``DatabaseWriteLock`` for the entire sync duration because
+    that would deadlock the ``WriteCoordinator`` running in the same process
+    (``flock`` is per-open-file-description, not per-process).  Instead we
+    rely on SQLite WAL + ``busy_timeout`` for write serialisation here, and
+    the ``WriteCoordinator``'s per-task flock for MCP writes.
+    """
     paths = resolve_paths(config, config_path)
-    with write_locked(paths.db_path) as conn:
-        initialize_db(conn)
+    conn = connect(paths.db_path)
+    initialize_db(conn)
+    try:
         return sync_with_lock(conn, config, source=source, lock_path=lock_path)
+    finally:
+        conn.close()
 
 
 def sync_with_lock(
